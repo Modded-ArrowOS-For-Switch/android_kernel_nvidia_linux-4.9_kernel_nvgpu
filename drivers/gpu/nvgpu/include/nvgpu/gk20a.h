@@ -1747,7 +1747,7 @@ struct gk20a_cyclestate_buffer_elem {
 
 /* register accessors */
 void __nvgpu_check_gpu_state(struct gk20a *g);
-void __gk20a_warn_on_no_regs(void);
+void nvgpu_report_no_regs(struct gk20a *g, const char *f, u32 r, u32 v);
 
 /* classes that the device supports */
 /* TBD: get these from an open-sourced SDK? */
