@@ -262,6 +262,7 @@ struct gk20a_platform gv11b_tegra_platform = {
 	/* ptimer src frequency in hz*/
 	.ptimer_src_freq	= 31250000,
 
+	.cde_timeouts_enabled = false,
 	.ch_wdt_timeout_ms = 5000,
 
 	.probe = gv11b_tegra_probe,

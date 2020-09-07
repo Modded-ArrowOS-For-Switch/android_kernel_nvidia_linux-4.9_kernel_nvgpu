@@ -1488,6 +1488,7 @@ struct gk20a {
 	struct railgate_stats pstats;
 #endif
 	u32 gr_idle_timeout_default;
+	bool cde_timeouts_enabled;
 	bool timeouts_disabled_by_user;
 	unsigned int ch_wdt_timeout_ms;
 	u32 fifo_eng_timeout_us;

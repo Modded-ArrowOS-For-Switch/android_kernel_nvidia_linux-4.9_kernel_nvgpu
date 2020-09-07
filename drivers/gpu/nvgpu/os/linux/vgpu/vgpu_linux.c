@@ -392,6 +392,7 @@ int vgpu_probe(struct platform_device *pdev)
 
 	nvgpu_spinlock_init(&gk20a->mc_enable_lock);
 
+	gk20a->cde_timeouts_enabled = platform->cde_timeouts_enabled;
 	gk20a->ch_wdt_timeout_ms = platform->ch_wdt_timeout_ms;
 
 	/* Initialize the platform interface. */

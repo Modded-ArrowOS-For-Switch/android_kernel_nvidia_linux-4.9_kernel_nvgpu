@@ -112,6 +112,9 @@ struct gk20a_platform {
 	/* Memory System Clock Gating: true = enable flase = disable*/
 	bool enable_mscg;
 
+	/* Default timeout setting per platform for CDE */
+	bool cde_timeouts_enabled;
+
 	/* Timeout for per-channel watchdog (in mS) */
 	u32 ch_wdt_timeout_ms;
 
