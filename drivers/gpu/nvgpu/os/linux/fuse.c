@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2017-2020, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -11,14 +11,49 @@
  * more details.
  */
 
-#include <soc/tegra/fuse.h>
-
 #include <nvgpu/fuse.h>
 
-int nvgpu_tegra_get_gpu_speedo_id(struct gk20a *g)
+#include <nvgpu/linux/soc_fuse.h>
+
+#include <soc/tegra/fuse.h>
+
+int nvgpu_tegra_get_gpu_speedo_id(struct gk20a *g, int *id)
 {
-	return tegra_sku_info.gpu_speedo_id;
+	*id = tegra_sku_info.gpu_speedo_id;
+
+	return 0;
 }
+
+int nvgpu_tegra_fuse_read_reserved_calib(struct gk20a *g, u32 *val)
+{
+	return tegra_fuse_readl(FUSE_RESERVED_CALIB0_0, val);
+}
+
+int nvgpu_tegra_fuse_read_gcplex_config_fuse(struct gk20a *g, u32 *val)
+{
+	return tegra_fuse_readl(FUSE_GCPLEX_CONFIG_FUSE_0, val);
+}
+
+int nvgpu_tegra_fuse_read_per_device_identifier(struct gk20a *g, u64 *pdi)
+{
+	u32 lo = 0U;
+	u32 hi = 0U;
+	int err;
+
+	err = tegra_fuse_readl(FUSE_PDI0, &lo);
+	if (err)
+		return err;
+
+	err = tegra_fuse_readl(FUSE_PDI1, &hi);
+	if (err)
+		return err;
+
+	*pdi = ((u64)lo) | (((u64)hi) << 32);
+
+	return 0;
+}
+
+#ifdef CONFIG_NVGPU_TEGRA_FUSE
 
 /*
  * Use tegra_fuse_control_read/write() APIs for fuse offsets upto 0x100
@@ -44,12 +79,4 @@ void nvgpu_tegra_fuse_write_opt_gpu_tpc1_disable(struct gk20a *g, u32 val)
 	tegra_fuse_writel(val, FUSE_OPT_GPU_TPC1_DISABLE_0);
 }
 
-int nvgpu_tegra_fuse_read_gcplex_config_fuse(struct gk20a *g, u32 *val)
-{
-	return tegra_fuse_readl(FUSE_GCPLEX_CONFIG_FUSE_0, val);
-}
-
-int nvgpu_tegra_fuse_read_reserved_calib(struct gk20a *g, u32 *val)
-{
-	return tegra_fuse_readl(FUSE_RESERVED_CALIB0_0, val);
-}
+#endif /* CONFIG_NVGPU_TEGRA_FUSE */

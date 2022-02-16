@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017-2018, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2017-2019, NVIDIA CORPORATION.  All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -20,9 +20,21 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
+#ifdef CONFIG_NVGPU_IOCTL_NON_FUSA
 #include <nvgpu/ptimer.h>
 #include <nvgpu/timers.h>
 #include <nvgpu/gk20a.h>
+#include <nvgpu/nvgpu_init.h>
+#include <nvgpu/power_features/cg.h>
+
+int nvgpu_ptimer_init(struct gk20a *g)
+{
+#if defined(CONFIG_NVGPU_NEXT)
+	nvgpu_cg_slcg_timer_load_enable(g);
+#endif
+
+	return 0;
+}
 
 int nvgpu_get_timestamps_zipper(struct gk20a *g,
 		u32 source_id, u32 count,
@@ -31,7 +43,7 @@ int nvgpu_get_timestamps_zipper(struct gk20a *g,
 	int err = 0;
 	unsigned int i = 0;
 
-	if (gk20a_busy(g)) {
+	if (gk20a_busy(g) != 0) {
 		nvgpu_err(g, "GPU not powered on\n");
 		err = -EINVAL;
 		goto end;
@@ -39,7 +51,7 @@ int nvgpu_get_timestamps_zipper(struct gk20a *g,
 
 	for (i = 0; i < count; i++) {
 		err = g->ops.ptimer.read_ptimer(g, &samples[i].gpu_timestamp);
-		if (err) {
+		if (err != 0) {
 			return err;
 		}
 
@@ -50,3 +62,4 @@ end:
 	gk20a_idle(g);
 	return err;
 }
+#endif

@@ -1,7 +1,7 @@
 /*
  * GK20A Platform (SoC) Interface
  *
- * Copyright (c) 2014-2019, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2014-2021, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -24,7 +24,7 @@
 #define GK20A_CLKS_MAX		4
 
 struct gk20a;
-struct channel_gk20a;
+struct nvgpu_channel;
 struct gr_ctx_buffer_desc;
 struct gk20a_scale_profile;
 
@@ -35,12 +35,44 @@ struct secure_page_buffer {
 	size_t used;
 };
 
+enum {
+	PCI_GPIO_VBAT_PWR_ON,
+	PCI_GPIO_PRSNT2,
+	PCI_GPIO_PRSNT1,
+	PCI_GPIO_PWR_ON,
+	PCI_GPIO_PG,
+	PCI_GPIO_MAX,
+};
+
+struct nvgpu_pci_gpios {
+	int gpios[PCI_GPIO_MAX];
+};
+
+/* delays in milliseconds (ms) */
+#define PCI_VBAR_PWR_ON_DELAY_MS	15
+#define PCI_PWR_ON_DELAY_MS		250
+#define PCI_VBAR_PWR_OFF_DELAY_MS	2
+#define PCI_PWR_OFF_DELAY_MS		2
+
+enum tegra_chip_id {
+	TEGRA_124,
+	TEGRA_132,
+	TEGRA_210,
+	TEGRA_186,
+	TEGRA_194,
+	TEGRA_194_VGPU,
+	TEGRA_234,
+};
+
 struct gk20a_platform {
 	/* Populated by the gk20a driver before probing the platform. */
 	struct gk20a *g;
 
 	/* Should be populated at probe. */
 	bool can_railgate_init;
+
+	/* controls gc off feature for pci gpu */
+	bool can_pci_gc_off;
 
 	/* Should be populated at probe. */
 	bool can_tpc_powergate;
@@ -54,14 +86,14 @@ struct gk20a_platform {
 	/* channel limit after which to start aggressive sync destroy */
 	unsigned int aggressive_sync_destroy_thresh;
 
-	/* flag to set sync destroy aggressiveness */
-	bool aggressive_sync_destroy;
-
 	/* set if ASPM should be disabled on boot; only makes sense for PCI */
 	bool disable_aspm;
 
 	/* Set if the platform can unify the small/large address spaces. */
 	bool unify_address_spaces;
+
+	/* P-state */
+	bool pstate;
 
 	/* Clock configuration is stored here. Platform probe is responsible
 	 * for filling this data. */
@@ -103,6 +135,9 @@ struct gk20a_platform {
 	/* Engine Level Power Gating: true = enable flase = disable */
 	bool enable_elpg;
 
+	/* Memory System power Gating: true = enable false = disable*/
+	bool enable_elpg_ms;
+
 	/* Adaptative ELPG: true = enable flase = disable */
 	bool enable_aelpg;
 
@@ -113,16 +148,13 @@ struct gk20a_platform {
 	bool enable_mscg;
 
 	/* Timeout for per-channel watchdog (in mS) */
-	u32 ch_wdt_timeout_ms;
+	u32 ch_wdt_init_limit_ms;
 
 	/* Disable big page support */
 	bool disable_bigpage;
 
-	/*
-	 * gk20a_do_idle() API can take GPU either into rail gate or CAR reset
-	 * This flag can be used to force CAR reset case instead of rail gate
-	 */
-	bool force_reset_in_do_idle;
+	/* Disable nvlink support */
+	bool disable_nvlink;
 
 	/* guest/vm id, needed for IPA to PA transation */
 	int vmid;
@@ -220,7 +252,7 @@ struct gk20a_platform {
 	 * addresses (not IPA). This is the case for GV100 nvlink in HV+L
 	 * configuration, when dGPU is in pass-through mode.
 	 */
-	u64 (*phys_addr)(struct gk20a *g, u64 ipa);
+	u64 (*phys_addr)(struct gk20a *g, u64 ipa, u64 *pa_len);
 
 	/* Callbacks to assert/deassert GPU reset */
 	int (*reset_assert)(struct device *dev);
@@ -229,7 +261,7 @@ struct gk20a_platform {
 	struct dvfs_rail *gpu_rail;
 
 	bool virtual_dev;
-#ifdef CONFIG_TEGRA_GR_VIRTUALIZATION
+#ifdef CONFIG_NVGPU_GR_VIRTUALIZATION
 	void *vgpu_priv;
 #endif
 	/* source frequency for ptimer in hz */
@@ -239,6 +271,8 @@ struct gk20a_platform {
 	bool has_cde;
 #endif
 
+	enum tegra_chip_id platform_chip_id;
+
 	/* soc name for finding firmware files */
 	const char *soc_name;
 
@@ -246,7 +280,7 @@ struct gk20a_platform {
 	bool honors_aperture;
 	/* unified or split memory with separate vidmem? */
 	bool unified_memory;
-	/* WAR for gm20b chips. */
+	/* Fix for gm20b chips. */
 	bool force_128K_pmu_vm;
 
 	/*
@@ -254,9 +288,6 @@ struct gk20a_platform {
 	 * 0x3ffffffff (i.e a 34 bit mask).
 	 */
 	u64 dma_mask;
-
-	/* minimum supported VBIOS version */
-	u32 vbios_min_version;
 
 	/* true if we run preos microcode on this board */
 	bool run_preos;
@@ -288,8 +319,7 @@ static inline struct gk20a_platform *gk20a_get_platform(
 extern struct gk20a_platform gm20b_tegra_platform;
 extern struct gk20a_platform gp10b_tegra_platform;
 extern struct gk20a_platform gv11b_tegra_platform;
-#ifdef CONFIG_TEGRA_GR_VIRTUALIZATION
-extern struct gk20a_platform vgpu_tegra_platform;
+#ifdef CONFIG_NVGPU_GR_VIRTUALIZATION
 extern struct gk20a_platform gv11b_vgpu_tegra_platform;
 #endif
 #endif

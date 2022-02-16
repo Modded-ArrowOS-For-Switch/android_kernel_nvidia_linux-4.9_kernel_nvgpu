@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017-2018, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2017-2021, NVIDIA CORPORATION.  All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -25,10 +25,8 @@
 
 #ifdef __KERNEL__
 #include <nvgpu/linux/cond.h>
-#elif defined(__NVGPU_POSIX__)
-#include <nvgpu/posix/cond.h>
 #else
-#include <nvgpu_rmos/include/cond.h>
+#include <nvgpu/posix/cond.h>
 #endif
 
 /*
@@ -39,67 +37,108 @@
 struct nvgpu_cond;
 
 /**
- * nvgpu_cond_init - Initialize a condition variable
+ * @brief Initialize a condition variable.
  *
- * @cond - The condition variable to initialize
+ * @param cond [in]	The condition variable to initialize.
  *
  * Initialize a condition variable before using it.
+ *
+ * @return If successful, this function returns 0. Otherwise, an error number
+ * is returned to indicate the error.
+ *
+ * @retval ENOMEM for insufficient memory.
+ * @retval EINVAL for invalid value.
+ * @retval EBUSY for a pthread condition variable pointer to a previously
+ * initialized condition variable that hasn't been destroyed.
+ * @retval EFAULT for any faults that occurred while trying to access the
+ * condition variable or attribute.
  */
 int nvgpu_cond_init(struct nvgpu_cond *cond);
 
 /**
- * nvgpu_cond_signal - Signal a condition variable
+ * @brief Signal a condition variable.
  *
- * @cond - The condition variable to signal
+ * This function is used to unblock a thread blocked on a condition variable.
+ * Wakes up at least one of the threads that are blocked on the specified
+ * condition variable \a cond.
  *
- * Wake up a waiter for a condition variable to check if its condition has been
- * satisfied.
- *
- * The waiter is using an uninterruptible wait.
+ * @param cond [in]	The condition variable to signal.
+ * 			  - Should not to be equal to NULL.
+ * 			  - Structure pointed by \a cond should be initialized
+ * 			    before invoking this function.
  */
-int nvgpu_cond_signal(struct nvgpu_cond *cond);
+void nvgpu_cond_signal(struct nvgpu_cond *cond);
 
 /**
- * nvgpu_cond_signal_interruptible - Signal a condition variable
+ * @brief Signal a condition variable.
  *
- * @cond - The condition variable to signal
+ * Wakes up at least one of the threads that are blocked on the specified
+ * condition variable \a cond. In posix implementation, the function provides
+ * the same functionality as #nvgpu_cond_signal, but this function is being
+ * provided to be congruent with kernel implementations having interruptible
+ * and uninterruptible waits.
  *
- * Wake up a waiter for a condition variable to check if its condition has been
- * satisfied.
- *
- * The waiter is using an interruptible wait.
+ * @param cond [in]	The condition variable to signal.
+ * 			  - Should not to be equal to NULL.
+ * 			  - Structure pointed by \a cond should be initialized
+ * 			    before invoking this function.
  */
-int nvgpu_cond_signal_interruptible(struct nvgpu_cond *cond);
+void nvgpu_cond_signal_interruptible(struct nvgpu_cond *cond);
 
 /**
- * nvgpu_cond_broadcast - Signal all waiters of a condition variable
+ * @brief Signal all waiters of a condition variable.
  *
- * @cond - The condition variable to signal
+ * This function is used to unblock threads blocked on a condition variable.
+ * Wakes up all the threads that are blocked on the specified condition variable
+ * \a cond.
  *
- * Wake up all waiters for a condition variable to check if their conditions
- * have been satisfied.
+ * @param cond [in]	The condition variable to broadcast.
+ * 			  - Should not to be equal to NULL.
+ * 			  - Structure pointed by \a cond should be initialized
+ * 			    before invoking this function.
  *
- * The waiters are using an uninterruptible wait.
+ * @return If successful, this function returns 0. Otherwise, an error number
+ * is returned to indicate the error.
+ *
+ * @retval -EINVAL if \a cond is NULL or not initialized.
+ * @retval EFAULT a fault occurred while trying to access the buffers provided.
+ * @retval EINVAL for invalid condition variable. This error value is generated
+ * by the OS API used inside this function, which is returned as it is.
  */
 int nvgpu_cond_broadcast(struct nvgpu_cond *cond);
 
 /**
- * nvgpu_cond_broadcast_interruptible - Signal all waiters of a condition
- * variable
+ * @brief Signal all waiters of a condition variable.
  *
- * @cond - The condition variable to signal
+ * This function is used to unblock threads blocked on a condition variable.
+ * Wakes up all the threads that are blocked on the specified condition variable
+ * \a cond. In Posix implementation this API is same as #nvgpu_cond_broadcast in
+ * functionality, but the API is provided to be congruent with implementations
+ * having interruptible and uninterruptible waits.
  *
- * Wake up all waiters for a condition variable to check if their conditions
- * have been satisfied.
+ * @param cond [in]	The condition variable to broadcast.
+ * 			  - Should not to be equal to NULL.
+ * 			  - Structure pointed by \a cond should be initialized
+ * 			    before invoking this function.
  *
- * The waiters are using an interruptible wait.
+ * @return If successful, this function returns 0. Otherwise, an error number
+ * is returned to indicate the error.
+ *
+ * @retval -EINVAL if \a cond is NULL or not initialized.
+ * @retval EFAULT a fault occurred while trying to access the buffers provided.
+ * @retval EINVAL for invalid condition variable. This error value is generated
+ * by the OS API used inside this function, which is returned as it is.
  */
 int nvgpu_cond_broadcast_interruptible(struct nvgpu_cond *cond);
 
 /**
- * nvgpu_cond_destroy - Destroy a condition variable
+ * @brief Destroy a condition variable.
  *
- * @cond - The condition variable to destroy
+ * Destroys the condition variable along with the associated attributes and
+ * mutex.
+ *
+ * @param cond [in]	The condition variable to destroy.
+ * 			  - Should not to be equal to NULL.
  */
 void nvgpu_cond_destroy(struct nvgpu_cond *cond);
 

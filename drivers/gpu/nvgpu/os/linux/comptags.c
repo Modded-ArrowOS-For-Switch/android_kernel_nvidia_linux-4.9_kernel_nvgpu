@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2017-2018, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2017-2020, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -21,19 +21,19 @@
 
 #include <nvgpu/linux/vm.h>
 
-#include "dmabuf.h"
+#include "dmabuf_priv.h"
 
 void gk20a_get_comptags(struct nvgpu_os_buffer *buf,
 			struct gk20a_comptags *comptags)
 {
-	struct gk20a_dmabuf_priv *priv = dma_buf_get_drvdata(buf->dmabuf,
-							     buf->dev);
+	struct gk20a_dmabuf_priv *priv = gk20a_dma_buf_get_drvdata(buf->dmabuf,
+							buf->dev);
 
 	if (!comptags)
 		return;
 
 	if (!priv) {
-		memset(comptags, 0, sizeof(*comptags));
+		(void) memset(comptags, 0, sizeof(*comptags));
 		return;
 	}
 
@@ -47,13 +47,21 @@ int gk20a_alloc_or_get_comptags(struct gk20a *g,
 				struct gk20a_comptag_allocator *allocator,
 				struct gk20a_comptags *comptags)
 {
-	struct gk20a_dmabuf_priv *priv = dma_buf_get_drvdata(buf->dmabuf,
-							     buf->dev);
+	int ret = 0;
+
+	struct gk20a_dmabuf_priv *priv = NULL;
 	u32 offset;
 	int err;
-	unsigned int ctag_granularity;
+	u64 ctag_granularity;
 	u32 lines;
 
+	ret = gk20a_dmabuf_alloc_drvdata(buf->dmabuf, buf->dev);
+	if (ret) {
+		nvgpu_err(g, "error allocating comptags priv data");
+		return ret;
+	}
+
+	priv = gk20a_dma_buf_get_drvdata(buf->dmabuf, buf->dev);
 	if (!priv)
 		return -ENOSYS;
 
@@ -110,8 +118,8 @@ exit_locked:
 
 bool gk20a_comptags_start_clear(struct nvgpu_os_buffer *buf)
 {
-	struct gk20a_dmabuf_priv *priv = dma_buf_get_drvdata(buf->dmabuf,
-							     buf->dev);
+	struct gk20a_dmabuf_priv *priv = gk20a_dma_buf_get_drvdata(buf->dmabuf,
+						buf->dev);
 	bool clear_started = false;
 
 	if (priv) {
@@ -129,8 +137,8 @@ bool gk20a_comptags_start_clear(struct nvgpu_os_buffer *buf)
 void gk20a_comptags_finish_clear(struct nvgpu_os_buffer *buf,
 				 bool clear_successful)
 {
-	struct gk20a_dmabuf_priv *priv = dma_buf_get_drvdata(buf->dmabuf,
-							     buf->dev);
+	struct gk20a_dmabuf_priv *priv = gk20a_dma_buf_get_drvdata(buf->dmabuf,
+						buf->dev);
 	if (priv) {
 		if (clear_successful)
 			priv->comptags.needs_clear = false;

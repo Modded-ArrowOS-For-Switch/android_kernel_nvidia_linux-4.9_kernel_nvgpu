@@ -15,9 +15,11 @@
  */
 
 #include <linux/reboot.h>
+#include <nvgpu/errata.h>
 #include <linux/dma-mapping.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
+#include <linux/pm_runtime.h>
 #include <uapi/linux/nvgpu.h>
 
 #include <nvgpu/defaults.h>
@@ -29,13 +31,15 @@
 #include <nvgpu/debug.h>
 #include <nvgpu/sizes.h>
 #include <nvgpu/gk20a.h>
+#include <nvgpu/regops.h>
+#include <nvgpu/tsg.h>
+#include <nvgpu/gr/gr.h>
 
 #include "platform_gk20a.h"
 #include "module.h"
 #include "os_linux.h"
 #include "sysfs.h"
 #include "ioctl.h"
-#include "gk20a/regops_gk20a.h"
 
 #define EMC3D_DEFAULT_RATIO 750
 
@@ -50,31 +54,37 @@ static void nvgpu_init_vars(struct gk20a *g)
 	struct device *dev = dev_from_gk20a(g);
 	struct gk20a_platform *platform = dev_get_drvdata(dev);
 
-	nvgpu_cond_init(&l->sw_irq_stall_last_handled_wq);
-	nvgpu_cond_init(&l->sw_irq_nonstall_last_handled_wq);
+	nvgpu_cond_init(&g->mc.sw_irq_stall_last_handled_cond);
+	nvgpu_cond_init(&g->mc.sw_irq_nonstall_last_handled_cond);
 
 	init_rwsem(&l->busy_lock);
 	nvgpu_rwsem_init(&g->deterministic_busy);
 
-	nvgpu_spinlock_init(&g->mc_enable_lock);
+	nvgpu_spinlock_init(&g->mc.enable_lock);
+
+	nvgpu_spinlock_init(&g->power_spinlock);
+
+	nvgpu_spinlock_init(&g->mc.intr_lock);
 
 	nvgpu_mutex_init(&platform->railgate_lock);
 	nvgpu_mutex_init(&g->dbg_sessions_lock);
 	nvgpu_mutex_init(&g->client_lock);
 	nvgpu_mutex_init(&g->power_lock);
-	nvgpu_mutex_init(&g->ctxsw_disable_lock);
 	nvgpu_mutex_init(&g->tpc_pg_lock);
 	nvgpu_mutex_init(&g->clk_arb_enable_lock);
 	nvgpu_mutex_init(&g->cg_pg_lock);
+#if defined(CONFIG_NVGPU_CYCLESTATS)
+	nvgpu_mutex_init(&g->cs_lock);
+#endif
 
 	/* Init the clock req count to 0 */
 	nvgpu_atomic_set(&g->clk_arb_global_nr, 0);
 
-	nvgpu_mutex_init(&l->ctrl.privs_lock);
-	nvgpu_init_list_node(&l->ctrl.privs);
+	nvgpu_mutex_init(&l->ctrl_privs_lock);
+	nvgpu_init_list_node(&l->ctrl_privs);
 
-	l->regs_saved = l->regs;
-	l->bar1_saved = l->bar1;
+	g->regs_saved = g->regs;
+	g->bar1_saved = g->bar1;
 
 	g->emc3d_ratio = EMC3D_DEFAULT_RATIO;
 
@@ -91,21 +101,24 @@ static void nvgpu_init_vars(struct gk20a *g)
 
 	dma_set_mask(dev, platform->dma_mask);
 	dma_set_coherent_mask(dev, platform->dma_mask);
+	dma_set_seg_boundary(dev, platform->dma_mask);
 
 	nvgpu_init_list_node(&g->profiler_objects);
 
 	nvgpu_init_list_node(&g->boardobj_head);
 	nvgpu_init_list_node(&g->boardobjgrp_head);
 
-	__nvgpu_set_enabled(g, NVGPU_HAS_SYNCPOINTS, platform->has_syncpoints);
+	nvgpu_set_enabled(g, NVGPU_HAS_SYNCPOINTS, platform->has_syncpoints);
 }
 
-static void nvgpu_init_gr_vars(struct gk20a *g)
+static void nvgpu_init_max_comptag(struct gk20a *g)
 {
-	gk20a_init_gr(g);
-
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+	nvgpu_log_info(g, "total ram pages : %lu", totalram_pages());
+#else
 	nvgpu_log_info(g, "total ram pages : %lu", totalram_pages);
-	g->gr.max_comptag_mem = totalram_size_in_mb;
+#endif
+	g->max_comptag_mem = totalram_size_in_mb;
 }
 
 static void nvgpu_init_timeout(struct gk20a *g)
@@ -116,26 +129,30 @@ static void nvgpu_init_timeout(struct gk20a *g)
 	nvgpu_atomic_set(&g->timeouts_disabled_refcount, 0);
 
 	if (nvgpu_platform_is_silicon(g)) {
-		g->gr_idle_timeout_default = NVGPU_DEFAULT_GR_IDLE_TIMEOUT;
+		g->poll_timeout_default = NVGPU_DEFAULT_POLL_TIMEOUT_MS;
 	} else if (nvgpu_platform_is_fpga(g)) {
-		g->gr_idle_timeout_default = GK20A_TIMEOUT_FPGA;
+		g->poll_timeout_default = NVGPU_DEFAULT_FPGA_TIMEOUT_MS;
 	} else {
-		g->gr_idle_timeout_default = (u32)ULONG_MAX;
+		g->poll_timeout_default = (u32)ULONG_MAX;
 	}
-	g->ch_wdt_timeout_ms = platform->ch_wdt_timeout_ms;
-	g->fifo_eng_timeout_us = GRFIFO_TIMEOUT_CHECK_PERIOD_US;
+	g->ch_wdt_init_limit_ms = platform->ch_wdt_init_limit_ms;
+	g->ctxsw_timeout_period_ms = CTXSW_TIMEOUT_PERIOD_MS;
 }
 
 static void nvgpu_init_timeslice(struct gk20a *g)
 {
 	g->runlist_interleave = true;
 
-	g->timeslice_low_priority_us = 1300;
-	g->timeslice_medium_priority_us = 2600;
-	g->timeslice_high_priority_us = 5200;
+	g->tsg_timeslice_low_priority_us =
+			NVGPU_TSG_TIMESLICE_LOW_PRIORITY_US;
+	g->tsg_timeslice_medium_priority_us =
+			NVGPU_TSG_TIMESLICE_MEDIUM_PRIORITY_US;
+	g->tsg_timeslice_high_priority_us =
+			NVGPU_TSG_TIMESLICE_HIGH_PRIORITY_US;
 
-	g->min_timeslice_us = 1000;
-	g->max_timeslice_us = 50000;
+	g->tsg_timeslice_min_us = NVGPU_TSG_TIMESLICE_MIN_US;
+	g->tsg_timeslice_max_us = NVGPU_TSG_TIMESLICE_MAX_US;
+	g->tsg_dbg_timeslice_max_us = NVGPU_TSG_DBG_TIMESLICE_MAX_US_DEFAULT;
 }
 
 static void nvgpu_init_pm_vars(struct gk20a *g)
@@ -153,30 +170,21 @@ static void nvgpu_init_pm_vars(struct gk20a *g)
 		nvgpu_platform_is_silicon(g) ? platform->enable_blcg : false;
 	g->elcg_enabled =
 		nvgpu_platform_is_silicon(g) ? platform->enable_elcg : false;
-	g->elpg_enabled =
-		nvgpu_platform_is_silicon(g) ? platform->enable_elpg : false;
-	g->aelpg_enabled =
-		nvgpu_platform_is_silicon(g) ? platform->enable_aelpg : false;
-	g->mscg_enabled =
-		nvgpu_platform_is_silicon(g) ? platform->enable_mscg : false;
-	g->can_elpg =
-		nvgpu_platform_is_silicon(g) ? platform->can_elpg_init : false;
 
-	__nvgpu_set_enabled(g, NVGPU_GPU_CAN_ELCG,
+	nvgpu_set_enabled(g, NVGPU_GPU_CAN_ELCG,
 		nvgpu_platform_is_silicon(g) ? platform->can_elcg : false);
-	__nvgpu_set_enabled(g, NVGPU_GPU_CAN_SLCG,
+	nvgpu_set_enabled(g, NVGPU_GPU_CAN_SLCG,
 		nvgpu_platform_is_silicon(g) ? platform->can_slcg : false);
-	__nvgpu_set_enabled(g, NVGPU_GPU_CAN_BLCG,
+	nvgpu_set_enabled(g, NVGPU_GPU_CAN_BLCG,
 		nvgpu_platform_is_silicon(g) ? platform->can_blcg : false);
 
-	g->aggressive_sync_destroy = platform->aggressive_sync_destroy;
 	g->aggressive_sync_destroy_thresh = platform->aggressive_sync_destroy_thresh;
 #ifdef CONFIG_NVGPU_SUPPORT_CDE
 	g->has_cde = platform->has_cde;
 #endif
 	g->ptimer_src_freq = platform->ptimer_src_freq;
-	g->support_pmu = support_gk20a_pmu(dev_from_gk20a(g));
-	__nvgpu_set_enabled(g, NVGPU_CAN_RAILGATE, platform->can_railgate_init);
+
+	nvgpu_set_enabled(g, NVGPU_CAN_RAILGATE, platform->can_railgate_init);
 	g->can_tpc_powergate = platform->can_tpc_powergate;
 
 	for (i = 0; i < MAX_TPC_PG_CONFIGS; i++)
@@ -188,24 +196,47 @@ static void nvgpu_init_pm_vars(struct gk20a *g)
 		g->railgate_delay = platform->railgate_delay_init;
 	else
 		g->railgate_delay = NVGPU_DEFAULT_RAILGATE_IDLE_TIMEOUT;
-	__nvgpu_set_enabled(g, NVGPU_PMU_PERFMON, platform->enable_perfmon);
 
-	/* set default values to aelpg parameters */
-	g->pmu.aelpg_param[0] = APCTRL_SAMPLING_PERIOD_PG_DEFAULT_US;
-	g->pmu.aelpg_param[1] = APCTRL_MINIMUM_IDLE_FILTER_DEFAULT_US;
-	g->pmu.aelpg_param[2] = APCTRL_MINIMUM_TARGET_SAVING_DEFAULT_US;
-	g->pmu.aelpg_param[3] = APCTRL_POWER_BREAKEVEN_DEFAULT_US;
-	g->pmu.aelpg_param[4] = APCTRL_CYCLES_PER_SAMPLE_MAX_DEFAULT;
+	g->support_ls_pmu = support_gk20a_pmu(dev_from_gk20a(g));
 
-	__nvgpu_set_enabled(g, NVGPU_SUPPORT_ASPM, !platform->disable_aspm);
+	if (g->support_ls_pmu) {
+		g->elpg_enabled =
+			nvgpu_platform_is_silicon(g) ? platform->enable_elpg : false;
+		g->aelpg_enabled =
+			nvgpu_platform_is_silicon(g) ? platform->enable_aelpg : false;
+		g->mscg_enabled =
+			nvgpu_platform_is_silicon(g) ? platform->enable_mscg : false;
+		g->can_elpg =
+			nvgpu_platform_is_silicon(g) ? platform->can_elpg_init : false;
+		if (nvgpu_is_enabled(g, NVGPU_SUPPORT_MIG)) {
+			g->can_elpg = false;
+		}
+
+		nvgpu_set_enabled(g, NVGPU_PMU_PERFMON, platform->enable_perfmon);
+
+		/* ELPG feature enable is SW pre-requisite for ELPG_MS */
+		if (g->elpg_enabled) {
+			nvgpu_set_enabled(g, NVGPU_ELPG_MS_ENABLED,
+						platform->enable_elpg_ms);
+		}
+	}
+
+	nvgpu_set_enabled(g, NVGPU_SUPPORT_ASPM, !platform->disable_aspm);
+#ifdef CONFIG_NVGPU_SIM
+	if (nvgpu_is_enabled(g, NVGPU_IS_FMODEL)) {
+		nvgpu_set_enabled(g, NVGPU_PMU_PSTATE, false);
+	} else
+#endif
+	{
+		nvgpu_set_enabled(g, NVGPU_PMU_PSTATE, platform->pstate);
+	}
 }
 
 static void nvgpu_init_vbios_vars(struct gk20a *g)
 {
 	struct gk20a_platform *platform = dev_get_drvdata(dev_from_gk20a(g));
 
-	__nvgpu_set_enabled(g, NVGPU_PMU_RUN_PREOS, platform->run_preos);
-	g->vbios_min_version = platform->vbios_min_version;
+	nvgpu_set_enabled(g, NVGPU_PMU_RUN_PREOS, platform->run_preos);
 }
 
 static void  nvgpu_init_ltc_vars(struct gk20a *g)
@@ -220,13 +251,13 @@ static void nvgpu_init_mm_vars(struct gk20a *g)
 	struct gk20a_platform *platform = dev_get_drvdata(dev_from_gk20a(g));
 
 	g->mm.disable_bigpage = platform->disable_bigpage;
-	__nvgpu_set_enabled(g, NVGPU_MM_HONORS_APERTURE,
+	nvgpu_set_enabled(g, NVGPU_MM_HONORS_APERTURE,
 			    platform->honors_aperture);
-	__nvgpu_set_enabled(g, NVGPU_MM_UNIFIED_MEMORY,
+	nvgpu_set_enabled(g, NVGPU_MM_UNIFIED_MEMORY,
 			    platform->unified_memory);
-	__nvgpu_set_enabled(g, NVGPU_MM_UNIFY_ADDRESS_SPACES,
+	nvgpu_set_enabled(g, NVGPU_MM_UNIFY_ADDRESS_SPACES,
 			    platform->unify_address_spaces);
-	__nvgpu_set_enabled(g, NVGPU_MM_FORCE_128K_PMU_VM,
+	nvgpu_set_errata(g, NVGPU_ERRATA_MM_FORCE_128K_PMU_VM,
 			    platform->force_128K_pmu_vm);
 
 	nvgpu_mutex_init(&g->mm.tlb_lock);
@@ -234,16 +265,15 @@ static void nvgpu_init_mm_vars(struct gk20a *g)
 }
 
 int nvgpu_probe(struct gk20a *g,
-		const char *debugfs_symlink,
-		const char *interface_name,
-		struct class *class)
+		const char *debugfs_symlink)
 {
 	struct device *dev = dev_from_gk20a(g);
 	struct gk20a_platform *platform = dev_get_drvdata(dev);
+	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
 	int err = 0;
 
 	nvgpu_init_vars(g);
-	nvgpu_init_gr_vars(g);
+	nvgpu_init_max_comptag(g);
 	nvgpu_init_timeout(g);
 	nvgpu_init_timeslice(g);
 	nvgpu_init_pm_vars(g);
@@ -266,11 +296,29 @@ int nvgpu_probe(struct gk20a *g,
 	}
 
 	nvgpu_init_mm_vars(g);
-
-	/* platform probe can defer do user init only if probe succeeds */
-	err = gk20a_user_init(dev, interface_name, class);
-	if (err)
+	err = gk20a_power_node_init(dev);
+	if (err) {
+		nvgpu_err(g, "power_node creation failed");
 		return err;
+	}
+
+	/*
+	* TODO: While removing the legacy nodes the following condition
+	* need to be removed.
+	*/
+	if (platform->platform_chip_id == TEGRA_210) {
+		err = gk20a_user_nodes_init(dev);
+		if (err)
+			return err;
+		l->dev_nodes_created = true;
+	}
+
+	/*
+	 * Note that for runtime suspend to work the clocks have to be setup
+	 * which happens in the probe call above. Hence the driver resume
+	 * is done here and not in gk20a_pm_init.
+	 */
+	pm_runtime_get_sync(dev);
 
 	if (platform->late_probe) {
 		err = platform->late_probe(dev);
@@ -280,9 +328,12 @@ int nvgpu_probe(struct gk20a *g,
 		}
 	}
 
+	pm_runtime_put_sync_autosuspend(dev);
+
 	nvgpu_create_sysfs(dev);
 	gk20a_debug_init(g, debugfs_symlink);
 
+#ifdef CONFIG_NVGPU_DEBUGGER
 	g->dbg_regops_tmp_buf = nvgpu_kzalloc(g, SZ_4K);
 	if (!g->dbg_regops_tmp_buf) {
 		nvgpu_err(g, "couldn't allocate regops tmp buf");
@@ -290,6 +341,7 @@ int nvgpu_probe(struct gk20a *g,
 	}
 	g->dbg_regops_tmp_buf_ops =
 		SZ_4K / sizeof(g->dbg_regops_tmp_buf[0]);
+#endif
 
 	g->remove_support = gk20a_remove_support;
 
@@ -298,94 +350,16 @@ int nvgpu_probe(struct gk20a *g,
 	return 0;
 }
 
-/**
- * cyclic_delta - Returns delta of cyclic integers a and b.
- *
- * @a - First integer
- * @b - Second integer
- *
- * Note: if a is ahead of b, delta is positive.
- */
-static int cyclic_delta(int a, int b)
-{
-	return a - b;
-}
-
-/**
- * nvgpu_wait_for_stall_interrupts - Wait for the stalling interrupts to
- *                                   complete.
- *
- * @g - The GPU to wait on.
- * @timeout - maximum time period to wait for.
- *
- * Waits until all stalling interrupt handlers that have been scheduled to run
- * have completed.
- */
-int nvgpu_wait_for_stall_interrupts(struct gk20a *g, u32 timeout)
-{
-	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
-	int stall_irq_threshold = atomic_read(&l->hw_irq_stall_count);
-
-	/* wait until all stalling irqs are handled */
-	return NVGPU_COND_WAIT(&l->sw_irq_stall_last_handled_wq,
-		   cyclic_delta(stall_irq_threshold,
-				atomic_read(&l->sw_irq_stall_last_handled))
-		   <= 0, timeout);
-}
-
-/**
- * nvgpu_wait_for_nonstall_interrupts - Wait for the nonstalling interrupts to
- *                                      complete.
- *
- * @g - The GPU to wait on.
- * @timeout - maximum time period to wait for.
- *
- * Waits until all non-stalling interrupt handlers that have been scheduled to
- * run have completed.
- */
-int nvgpu_wait_for_nonstall_interrupts(struct gk20a *g, u32 timeout)
-{
-	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
-	int nonstall_irq_threshold = atomic_read(&l->hw_irq_nonstall_count);
-
-	/* wait until all non-stalling irqs are handled */
-	return NVGPU_COND_WAIT(&l->sw_irq_nonstall_last_handled_wq,
-		   cyclic_delta(nonstall_irq_threshold,
-				atomic_read(&l->sw_irq_nonstall_last_handled))
-		   <= 0, timeout);
-}
-
-/**
- * nvgpu_wait_for_deferred_interrupts - Wait for interrupts to complete
- *
- * @g - The GPU to wait on.
- *
- * Waits until all interrupt handlers that have been scheduled to run have
- * completed.
- */
-void nvgpu_wait_for_deferred_interrupts(struct gk20a *g)
-{
-	int ret;
-
-	ret = nvgpu_wait_for_stall_interrupts(g, 0U);
-	if (ret != 0) {
-		nvgpu_err(g, "wait for stall interrupts failed %d", ret);
-	}
-
-	ret = nvgpu_wait_for_nonstall_interrupts(g, 0U);
-	if (ret != 0) {
-		nvgpu_err(g, "wait for nonstall interrupts failed %d", ret);
-	}
-}
-
 static void nvgpu_free_gk20a(struct gk20a *g)
 {
 	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
+
+	g->probe_done = false;
 
 	kfree(l);
 }
 
 void nvgpu_init_gk20a(struct gk20a *g)
 {
-	g->free = nvgpu_free_gk20a;
+	g->gfree = nvgpu_free_gk20a;
 }

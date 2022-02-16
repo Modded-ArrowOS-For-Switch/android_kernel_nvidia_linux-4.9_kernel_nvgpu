@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011-2019, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2011-2021, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -17,18 +17,38 @@
 #include <linux/device.h>
 #include <linux/pm_runtime.h>
 #include <linux/fb.h>
+#include <linux/version.h>
 
+#include <nvgpu/errata.h>
 #include <nvgpu/kmem.h>
 #include <nvgpu/nvhost.h>
 #include <nvgpu/ptimer.h>
+#include <nvgpu/string.h>
+#include <nvgpu/gr/global_ctx.h>
+#include <nvgpu/gr/config.h>
+#include <nvgpu/gr/obj_ctx.h>
+#include <nvgpu/gr/gr_falcon.h>
+#include <nvgpu/gr/gr.h>
+#include <nvgpu/gr/gr_utils.h>
+#include <nvgpu/gr/gr_instances.h>
+#include <nvgpu/grmgr.h>
 #include <nvgpu/power_features/cg.h>
 #include <nvgpu/power_features/pg.h>
+#include <nvgpu/pmu/pmu_perfmon.h>
+#include <nvgpu/pmu/fw.h>
+#include <nvgpu/pmu/pmu_pg.h>
+#include <nvgpu/nvgpu_init.h>
 
 #include "os_linux.h"
 #include "sysfs.h"
 #include "platform_gk20a.h"
-#include "gk20a/gr_gk20a.h"
-#include "gv11b/gr_gv11b.h"
+
+#ifdef CONFIG_NVGPU_MIG
+#include <nvgpu/enabled.h>
+#include <nvgpu/string.h>
+#include <nvgpu/engines.h>
+#include <nvgpu/device.h>
+#endif
 
 #define PTIMER_FP_FACTOR			1000000
 
@@ -47,8 +67,9 @@ static ssize_t elcg_enable_store(struct device *dev,
 		return -EINVAL;
 
 	err = gk20a_busy(g);
-	if (err)
+	if (err) {
 		return err;
+	}
 
 	if (val) {
 		nvgpu_cg_elcg_set_elcg_enabled(g, true);
@@ -69,7 +90,7 @@ static ssize_t elcg_enable_read(struct device *dev,
 {
 	struct gk20a *g = get_gk20a(dev);
 
-	return snprintf(buf, PAGE_SIZE, "%d\n", g->elcg_enabled ? 1 : 0);
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%d\n", g->elcg_enabled ? 1 : 0);
 }
 
 static DEVICE_ATTR(elcg_enable, ROOTRW, elcg_enable_read, elcg_enable_store);
@@ -85,14 +106,16 @@ static ssize_t blcg_enable_store(struct device *dev,
 		return -EINVAL;
 
 	err = gk20a_busy(g);
-	if (err)
+	if (err) {
 		return err;
+	}
 
 	if (val) {
 		nvgpu_cg_blcg_set_blcg_enabled(g, true);
 	} else {
 		nvgpu_cg_blcg_set_blcg_enabled(g, false);
 	}
+
 
 	gk20a_idle(g);
 
@@ -107,7 +130,7 @@ static ssize_t blcg_enable_read(struct device *dev,
 {
 	struct gk20a *g = get_gk20a(dev);
 
-	return snprintf(buf, PAGE_SIZE, "%d\n", g->blcg_enabled ? 1 : 0);
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%d\n", g->blcg_enabled ? 1 : 0);
 }
 
 
@@ -139,6 +162,7 @@ static ssize_t slcg_enable_store(struct device *dev,
 	 * init. Therefore, it would be incongruous to add it here. Once
 	 * it is added to init, we should add it here too.
 	 */
+
 	gk20a_idle(g);
 
 	nvgpu_info(g, "SLCG is %s.", val ? "enabled" :
@@ -152,7 +176,7 @@ static ssize_t slcg_enable_read(struct device *dev,
 {
 	struct gk20a *g = get_gk20a(dev);
 
-	return snprintf(buf, PAGE_SIZE, "%d\n", g->slcg_enabled ? 1 : 0);
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%d\n", g->slcg_enabled ? 1 : 0);
 }
 
 static DEVICE_ATTR(slcg_enable, ROOTRW, slcg_enable_read, slcg_enable_store);
@@ -176,7 +200,7 @@ static ssize_t ptimer_scale_factor_show(struct device *dev,
 				((u32)(src_freq_hz) /
 				(u32)(PTIMER_FP_FACTOR));
 	res = snprintf(buf,
-				PAGE_SIZE,
+				NVGPU_CPU_PAGE_SIZE,
 				"%u.%u\n",
 				scaling_factor_fp / PTIMER_FP_FACTOR,
 				scaling_factor_fp % PTIMER_FP_FACTOR);
@@ -204,7 +228,7 @@ static ssize_t ptimer_ref_freq_show(struct device *dev,
 		return -EINVAL;
 	}
 
-	res = snprintf(buf, PAGE_SIZE, "%u\n", PTIMER_REF_FREQ_HZ);
+	res = snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%u\n", PTIMER_REF_FREQ_HZ);
 
 	return res;
 
@@ -229,7 +253,7 @@ static ssize_t ptimer_src_freq_show(struct device *dev,
 		return -EINVAL;
 	}
 
-	res = snprintf(buf, PAGE_SIZE, "%u\n", src_freq_hz);
+	res = snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%u\n", src_freq_hz);
 
 	return res;
 
@@ -247,7 +271,7 @@ static ssize_t gpu_powered_on_show(struct device *dev,
 {
 	struct gk20a *g = get_gk20a(dev);
 
-	return snprintf(buf, PAGE_SIZE, "%u\n", g->power_on);
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%s\n", nvgpu_get_power_state(g));
 }
 
 static DEVICE_ATTR(gpu_powered_on, S_IRUGO, gpu_powered_on_show, NULL);
@@ -279,16 +303,17 @@ static ssize_t railgate_enable_store(struct device *dev,
 	}
 
 	if (railgate_enable) {
-		__nvgpu_set_enabled(g, NVGPU_CAN_RAILGATE, true);
+		nvgpu_set_enabled(g, NVGPU_CAN_RAILGATE, true);
 		pm_runtime_set_autosuspend_delay(dev, g->railgate_delay);
 	} else {
-		__nvgpu_set_enabled(g, NVGPU_CAN_RAILGATE, false);
+		nvgpu_set_enabled(g, NVGPU_CAN_RAILGATE, false);
 		pm_runtime_set_autosuspend_delay(dev, -1);
 	}
 	/* wake-up system to make rail-gating setting effective */
 	err = gk20a_busy(g);
-	if (err)
+	if (err) {
 		return err;
+	}
 	gk20a_idle(g);
 
 out:
@@ -304,7 +329,7 @@ static ssize_t railgate_enable_read(struct device *dev,
 {
 	struct gk20a *g = get_gk20a(dev);
 
-	return snprintf(buf, PAGE_SIZE, "%d\n",
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%d\n",
 			nvgpu_is_enabled(g, NVGPU_CAN_RAILGATE) ? 1 : 0);
 }
 
@@ -334,8 +359,9 @@ static ssize_t railgate_delay_store(struct device *dev,
 
 	/* wake-up system to make rail-gating delay effective immediately */
 	err = gk20a_busy(g);
-	if (err)
+	if (err) {
 		return err;
+	}
 	gk20a_idle(g);
 
 	return count;
@@ -345,7 +371,7 @@ static ssize_t railgate_delay_show(struct device *dev,
 {
 	struct gk20a *g = get_gk20a(dev);
 
-	return snprintf(buf, PAGE_SIZE, "%d\n", g->railgate_delay);
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%d\n", g->railgate_delay);
 }
 static DEVICE_ATTR(railgate_delay, ROOTRW, railgate_delay_show,
 		   railgate_delay_store);
@@ -359,7 +385,7 @@ static ssize_t is_railgated_show(struct device *dev,
 	if (platform->is_railgated)
 		is_railgated = platform->is_railgated(dev);
 
-	return snprintf(buf, PAGE_SIZE, "%s\n", is_railgated ? "yes" : "no");
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%s\n", is_railgated ? "yes" : "no");
 }
 static DEVICE_ATTR(is_railgated, S_IRUGO, is_railgated_show, NULL);
 
@@ -372,7 +398,7 @@ static ssize_t counters_show(struct device *dev,
 
 	nvgpu_pmu_get_load_counters(g, &busy_cycles, &total_cycles);
 
-	res = snprintf(buf, PAGE_SIZE, "%u %u\n", busy_cycles, total_cycles);
+	res = snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%u %u\n", busy_cycles, total_cycles);
 
 	return res;
 }
@@ -399,19 +425,20 @@ static ssize_t gk20a_load_show(struct device *dev,
 	ssize_t res;
 	int err;
 
-	if (!g->power_on) {
+	if (nvgpu_is_powered_off(g)) {
 		busy_time = 0;
 	} else {
 		err = gk20a_busy(g);
-		if (err)
+		if (err) {
 			return err;
+		}
 
 		nvgpu_pmu_load_update(g);
 		nvgpu_pmu_load_norm(g, &busy_time);
 		gk20a_idle(g);
 	}
 
-	res = snprintf(buf, PAGE_SIZE, "%u\n", busy_time);
+	res = snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%u\n", busy_time);
 
 	return res;
 }
@@ -427,26 +454,23 @@ static ssize_t elpg_enable_store(struct device *dev,
 	if (kstrtoul(buf, 10, &val) < 0)
 		return -EINVAL;
 
-	if (!g->power_on) {
-		return -EINVAL;
+	if (nvgpu_is_powered_off(g)) {
+		return -EAGAIN;
 	} else {
 		err = gk20a_busy(g);
-		if (err)
+		if (err != 0) {
 			return -EAGAIN;
-		/*
-		 * Since elpg is refcounted, we should not unnecessarily call
-		 * enable/disable if it is already so.
-		 */
+		}
 		if (val != 0) {
 			nvgpu_pg_elpg_set_elpg_enabled(g, true);
 		} else {
 			nvgpu_pg_elpg_set_elpg_enabled(g, false);
 		}
 		gk20a_idle(g);
-	}
-	nvgpu_info(g, "ELPG is %s.", val ? "enabled" :
-			"disabled");
 
+		nvgpu_info(g, "ELPG is %s.", val ? "enabled" :
+			"disabled");
+	}
 	return count;
 }
 
@@ -455,7 +479,7 @@ static ssize_t elpg_enable_read(struct device *dev,
 {
 	struct gk20a *g = get_gk20a(dev);
 
-	return snprintf(buf, PAGE_SIZE, "%d\n",
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%d\n",
 			nvgpu_pg_elpg_is_enabled(g) ? 1 : 0);
 }
 
@@ -465,8 +489,13 @@ static ssize_t ldiv_slowdown_factor_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct gk20a *g = get_gk20a(dev);
+	struct nvgpu_pmu *pmu = g->pmu;
 	unsigned long val = 0;
 	int err;
+
+	if (!nvgpu_is_errata_present(g, NVGPU_ERRATA_200391931)) {
+		return 0;
+	}
 
 	if (kstrtoul(buf, 10, &val) < 0) {
 		nvgpu_err(g, "parse error for input SLOWDOWN factor\n");
@@ -481,19 +510,19 @@ static ssize_t ldiv_slowdown_factor_store(struct device *dev,
 	if (val == g->ldiv_slowdown_factor)
 		return count;
 
-	if (!g->power_on) {
+	if (nvgpu_is_powered_off(g)) {
 		g->ldiv_slowdown_factor = val;
 	} else {
 		err = gk20a_busy(g);
-		if (err)
+		if (err) {
 			return -EAGAIN;
+		}
 
 		g->ldiv_slowdown_factor = val;
 
-		if (g->ops.pmu.pmu_pg_init_param)
-			g->ops.pmu.pmu_pg_init_param(g,
+		if (pmu->pg->init_param)
+			pmu->pg->init_param(g,
 				PMU_PG_ELPG_ENGINE_ID_GRAPHICS);
-
 		gk20a_idle(g);
 	}
 
@@ -507,7 +536,7 @@ static ssize_t ldiv_slowdown_factor_read(struct device *dev,
 {
 	struct gk20a *g = get_gk20a(dev);
 
-	return snprintf(buf, PAGE_SIZE, "%d\n", g->ldiv_slowdown_factor);
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%d\n", g->ldiv_slowdown_factor);
 }
 
 static DEVICE_ATTR(ldiv_slowdown_factor, ROOTRW,
@@ -517,29 +546,30 @@ static ssize_t mscg_enable_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct gk20a *g = get_gk20a(dev);
-	struct nvgpu_pmu *pmu = &g->pmu;
+	struct nvgpu_pmu *pmu = g->pmu;
 	unsigned long val = 0;
 	int err;
 
 	if (kstrtoul(buf, 10, &val) < 0)
 		return -EINVAL;
 
-	if (!g->power_on) {
+	if (nvgpu_is_powered_off(g)) {
 		g->mscg_enabled = val ? true : false;
 	} else {
 		err = gk20a_busy(g);
-		if (err)
+		if (err) {
 			return -EAGAIN;
+		}
 		/*
 		 * Since elpg is refcounted, we should not unnecessarily call
 		 * enable/disable if it is already so.
 		 */
 		if (val && !g->mscg_enabled) {
 			g->mscg_enabled = true;
-			if (g->ops.pmu.pmu_is_lpwr_feature_supported(g,
+			if (nvgpu_pmu_is_lpwr_feature_supported(g,
 					PMU_PG_LPWR_FEATURE_MSCG)) {
-				if (!ACCESS_ONCE(pmu->mscg_stat)) {
-					WRITE_ONCE(pmu->mscg_stat,
+				if (!READ_ONCE(pmu->pg->mscg_stat)) {
+					WRITE_ONCE(pmu->pg->mscg_stat,
 						PMU_MSCG_ENABLED);
 					/* make status visible */
 					smp_mb();
@@ -547,10 +577,10 @@ static ssize_t mscg_enable_store(struct device *dev,
 			}
 
 		} else if (!val && g->mscg_enabled) {
-			if (g->ops.pmu.pmu_is_lpwr_feature_supported(g,
+			if (nvgpu_pmu_is_lpwr_feature_supported(g,
 					PMU_PG_LPWR_FEATURE_MSCG)) {
 				nvgpu_pmu_pg_global_enable(g, false);
-				WRITE_ONCE(pmu->mscg_stat, PMU_MSCG_DISABLED);
+				WRITE_ONCE(pmu->pg->mscg_stat, PMU_MSCG_DISABLED);
 				/* make status visible */
 				smp_mb();
 				g->mscg_enabled = false;
@@ -573,7 +603,7 @@ static ssize_t mscg_enable_read(struct device *dev,
 {
 	struct gk20a *g = get_gk20a(dev);
 
-	return snprintf(buf, PAGE_SIZE, "%d\n", g->mscg_enabled ? 1 : 0);
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%d\n", g->mscg_enabled ? 1 : 0);
 }
 
 static DEVICE_ATTR(mscg_enable, ROOTRW, mscg_enable_read, mscg_enable_store);
@@ -584,7 +614,7 @@ static ssize_t aelpg_param_store(struct device *dev,
 	struct gk20a *g = get_gk20a(dev);
 	int status = 0;
 	union pmu_ap_cmd ap_cmd;
-	int *paramlist = (int *)g->pmu.aelpg_param;
+	int *paramlist = (int *)g->pmu->pg->aelpg_param;
 	u32 defaultparam[5] = {
 			APCTRL_SAMPLING_PERIOD_PG_DEFAULT_US,
 			APCTRL_MINIMUM_IDLE_FILTER_DEFAULT_US,
@@ -600,13 +630,14 @@ static ssize_t aelpg_param_store(struct device *dev,
 	/* If parameter value is 0 then reset to SW default values*/
 	if ((paramlist[0] | paramlist[1] | paramlist[2]
 		| paramlist[3] | paramlist[4]) == 0x00) {
-		memcpy(paramlist, defaultparam, sizeof(defaultparam));
+		nvgpu_memcpy((u8 *)paramlist, (u8 *)defaultparam,
+			sizeof(defaultparam));
 	}
 
 	/* If aelpg is enabled & pmu is ready then post values to
 	 * PMU else store then post later
 	 */
-	if (g->aelpg_enabled && g->pmu.pmu_ready) {
+	if (g->aelpg_enabled && nvgpu_pmu_get_fw_ready(g, g->pmu)) {
 		/* Disable AELPG */
 		ap_cmd.disable_ctrl.cmd_id = PMU_AP_CMD_ID_DISABLE_CTRL;
 		ap_cmd.disable_ctrl.ctrl_id = PMU_AP_CTRL_ID_GRAPHICS;
@@ -625,10 +656,10 @@ static ssize_t aelpg_param_read(struct device *dev,
 {
 	struct gk20a *g = get_gk20a(dev);
 
-	return snprintf(buf, PAGE_SIZE,
-		"%d %d %d %d %d\n", g->pmu.aelpg_param[0],
-		g->pmu.aelpg_param[1], g->pmu.aelpg_param[2],
-		g->pmu.aelpg_param[3], g->pmu.aelpg_param[4]);
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE,
+		"%d %d %d %d %d\n", g->pmu->pg->aelpg_param[0],
+		g->pmu->pg->aelpg_param[1], g->pmu->pg->aelpg_param[2],
+		g->pmu->pg->aelpg_param[3], g->pmu->pg->aelpg_param[4]);
 }
 
 static DEVICE_ATTR(aelpg_param, ROOTRW,
@@ -647,10 +678,11 @@ static ssize_t aelpg_enable_store(struct device *dev,
 		return -EINVAL;
 
 	err = gk20a_busy(g);
-	if (err)
+	if (err) {
 		return err;
+	}
 
-	if (g->pmu.pmu_ready) {
+	if (nvgpu_pmu_get_fw_ready(g, g->pmu)) {
 		if (val && !g->aelpg_enabled) {
 			g->aelpg_enabled = true;
 			/* Enable AELPG */
@@ -680,7 +712,7 @@ static ssize_t aelpg_enable_read(struct device *dev,
 {
 	struct gk20a *g = get_gk20a(dev);
 
-	return snprintf(buf, PAGE_SIZE, "%d\n", g->aelpg_enabled ? 1 : 0);
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%d\n", g->aelpg_enabled ? 1 : 0);
 }
 
 static DEVICE_ATTR(aelpg_enable, ROOTRW,
@@ -692,7 +724,7 @@ static ssize_t allow_all_enable_read(struct device *dev,
 {
 	struct gk20a *g = get_gk20a(dev);
 
-	return snprintf(buf, PAGE_SIZE, "%d\n", g->allow_all ? 1 : 0);
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%d\n", g->allow_all ? 1 : 0);
 }
 
 static ssize_t allow_all_enable_store(struct device *dev,
@@ -734,7 +766,7 @@ static ssize_t emc3d_ratio_read(struct device *dev,
 {
 	struct gk20a *g = get_gk20a(dev);
 
-	return snprintf(buf, PAGE_SIZE, "%d\n", g->emc3d_ratio);
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%d\n", g->emc3d_ratio);
 }
 
 static DEVICE_ATTR(emc3d_ratio, ROOTRW, emc3d_ratio_read, emc3d_ratio_store);
@@ -748,7 +780,7 @@ static ssize_t fmax_at_vmin_safe_read(struct device *dev,
 	if (g->ops.clk.get_fmax_at_vmin_safe)
 		gpu_fmax_at_vmin_hz = g->ops.clk.get_fmax_at_vmin_safe(g);
 
-	return snprintf(buf, PAGE_SIZE, "%d\n", (int)(gpu_fmax_at_vmin_hz));
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%d\n", (int)(gpu_fmax_at_vmin_hz));
 }
 
 static DEVICE_ATTR(fmax_at_vmin_safe, S_IRUGO, fmax_at_vmin_safe_read, NULL);
@@ -768,7 +800,7 @@ static ssize_t force_idle_store(struct device *dev,
 		if (g->forced_idle)
 			return count; /* do nothing */
 		else {
-			err = __gk20a_do_idle(g, false);
+			err = gk20a_do_idle(g);
 			if (!err) {
 				g->forced_idle = 1;
 				nvgpu_info(g, "gpu is idle : %d",
@@ -779,7 +811,7 @@ static ssize_t force_idle_store(struct device *dev,
 		if (!g->forced_idle)
 			return count; /* do nothing */
 		else {
-			err = __gk20a_do_unidle(g);
+			err = gk20a_do_unidle(g);
 			if (!err) {
 				g->forced_idle = 0;
 				nvgpu_info(g, "gpu is idle : %d",
@@ -796,11 +828,19 @@ static ssize_t force_idle_read(struct device *dev,
 {
 	struct gk20a *g = get_gk20a(dev);
 
-	return snprintf(buf, PAGE_SIZE, "%d\n", g->forced_idle ? 1 : 0);
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%d\n", g->forced_idle ? 1 : 0);
 }
 
 static DEVICE_ATTR(force_idle, ROOTRW, force_idle_read, force_idle_store);
 #endif
+
+static ssize_t tpc_pg_mask_read(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct gk20a *g = get_gk20a(dev);
+
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%d\n", g->tpc_pg_mask);
+}
 
 static bool is_tpc_mask_valid(struct gk20a *g, u32 tpc_mask)
 {
@@ -816,20 +856,12 @@ static bool is_tpc_mask_valid(struct gk20a *g, u32 tpc_mask)
 	return valid;
 }
 
-static ssize_t tpc_pg_mask_read(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct gk20a *g = get_gk20a(dev);
-
-	return snprintf(buf, PAGE_SIZE, "%d\n", g->tpc_pg_mask);
-}
-
 static ssize_t tpc_pg_mask_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct gk20a *g = get_gk20a(dev);
-	struct gr_gk20a *gr = &g->gr;
 	unsigned long val = 0;
+	struct nvgpu_gr_obj_ctx_golden_image *gr_golden_image = NULL;
 
 	nvgpu_mutex_acquire(&g->tpc_pg_lock);
 
@@ -844,12 +876,17 @@ static ssize_t tpc_pg_mask_store(struct device *dev,
 		goto exit;
 	}
 
-	if (gr->ctx_vars.golden_image_size) {
+	if (g->gr != NULL) {
+		gr_golden_image = nvgpu_gr_get_golden_image_ptr(g);
+	}
+
+	if (gr_golden_image &&
+			nvgpu_gr_obj_ctx_get_golden_image_size(gr_golden_image)
+			!= 0) {
 		nvgpu_err(g, "golden image size already initialized");
 		nvgpu_mutex_release(&g->tpc_pg_lock);
 		return -ENODEV;
 	}
-
 	/* checking that the value from userspace is within
 	 * the  possible valid TPC configurations.
 	 */
@@ -871,68 +908,94 @@ static DEVICE_ATTR(tpc_pg_mask, ROOTRW, tpc_pg_mask_read, tpc_pg_mask_store);
 static ssize_t tpc_fs_mask_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
+#ifdef CONFIG_NVGPU_TEGRA_FUSE
 	struct gk20a *g = get_gk20a(dev);
+	struct nvgpu_gr_config *gr_config;
+	struct nvgpu_gr_obj_ctx_golden_image *gr_golden_image;
+	struct nvgpu_gr_falcon *gr_falcon;
 	unsigned long val = 0;
 
 	if (kstrtoul(buf, 10, &val) < 0)
 		return -EINVAL;
 
-	if (!g->gr.gpc_tpc_mask)
+	if (g->gr == NULL) {
+		return -ENODEV;
+	}
+
+	gr_config = nvgpu_gr_get_config_ptr(g);
+	gr_golden_image = nvgpu_gr_get_golden_image_ptr(g);
+	gr_falcon = nvgpu_gr_get_falcon_ptr(g);
+
+	if (nvgpu_gr_config_get_gpc_tpc_mask_base(gr_config) == NULL)
 		return -ENODEV;
 
-	if (val && val != g->gr.gpc_tpc_mask[0] && g->ops.gr.set_gpc_tpc_mask) {
-		g->gr.gpc_tpc_mask[0] = val;
+	if (val && val != nvgpu_gr_config_get_gpc_tpc_mask(gr_config, 0) &&
+		g->ops.gr.set_gpc_tpc_mask) {
+		nvgpu_gr_config_set_gpc_tpc_mask(gr_config, 0, val);
 		g->tpc_fs_mask_user = val;
 
 		g->ops.gr.set_gpc_tpc_mask(g, 0);
 
-		nvgpu_vfree(g, g->gr.ctx_vars.local_golden_image);
-		g->gr.ctx_vars.local_golden_image = NULL;
-		g->gr.ctx_vars.golden_image_initialized = false;
-		g->gr.ctx_vars.golden_image_size = 0;
+		nvgpu_gr_obj_ctx_set_golden_image_size(gr_golden_image, 0);
+		nvgpu_gr_obj_ctx_deinit(g, gr_golden_image);
+		nvgpu_gr_reset_golden_image_ptr(g);
+
+		nvgpu_gr_falcon_remove_support(g, gr_falcon);
+		nvgpu_gr_reset_falcon_ptr(g);
+
+		nvgpu_gr_config_deinit(g, gr_config);
 		/* Cause next poweron to reinit just gr */
-		g->gr.sw_ready = false;
+		nvgpu_gr_sw_ready(g, false);
 	}
 
 	return count;
+#else
+	return -ENODEV;
+#endif
 }
 
 static ssize_t tpc_fs_mask_read(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
 	struct gk20a *g = get_gk20a(dev);
-	struct gr_gk20a *gr = &g->gr;
+	struct nvgpu_gr_config *gr_config = nvgpu_gr_get_config_ptr(g);
 	u32 gpc_index;
 	u32 tpc_fs_mask = 0;
 	int err = 0;
+	u32 cur_gr_instance = nvgpu_gr_get_cur_instance_id(g);
+	u32 gpc_phys_id;
 
 	err = gk20a_busy(g);
 	if (err)
 		return err;
 
-	for (gpc_index = 0; gpc_index < gr->gpc_count; gpc_index++) {
-		if (g->ops.gr.get_gpc_tpc_mask)
+	for (gpc_index = 0;
+	     gpc_index < nvgpu_gr_config_get_gpc_count(gr_config);
+	     gpc_index++) {
+		gpc_phys_id = nvgpu_grmgr_get_gr_gpc_phys_id(g,
+				cur_gr_instance, gpc_index);
+		if (g->ops.gr.config.get_gpc_tpc_mask)
 			tpc_fs_mask |=
-				g->ops.gr.get_gpc_tpc_mask(g, gpc_index) <<
-				(gr->max_tpc_per_gpc_count * gpc_index);
+				g->ops.gr.config.get_gpc_tpc_mask(g, gr_config, gpc_phys_id) <<
+				(nvgpu_gr_config_get_max_tpc_per_gpc_count(gr_config) * gpc_index);
 	}
 
 	gk20a_idle(g);
 
-	return snprintf(buf, PAGE_SIZE, "0x%x\n", tpc_fs_mask);
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "0x%x\n", tpc_fs_mask);
 }
 
 static DEVICE_ATTR(tpc_fs_mask, ROOTRW, tpc_fs_mask_read, tpc_fs_mask_store);
 
-static ssize_t min_timeslice_us_read(struct device *dev,
+static ssize_t tsg_timeslice_min_us_read(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
 	struct gk20a *g = get_gk20a(dev);
 
-	return snprintf(buf, PAGE_SIZE, "%u\n", g->min_timeslice_us);
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%u\n", g->tsg_timeslice_min_us);
 }
 
-static ssize_t min_timeslice_us_store(struct device *dev,
+static ssize_t tsg_timeslice_min_us_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct gk20a *g = get_gk20a(dev);
@@ -941,26 +1004,26 @@ static ssize_t min_timeslice_us_store(struct device *dev,
 	if (kstrtoul(buf, 10, &val) < 0)
 		return -EINVAL;
 
-	if (val > g->max_timeslice_us)
+	if (val > g->tsg_timeslice_max_us)
 		return -EINVAL;
 
-	g->min_timeslice_us = val;
+	g->tsg_timeslice_min_us = val;
 
 	return count;
 }
 
-static DEVICE_ATTR(min_timeslice_us, ROOTRW, min_timeslice_us_read,
-		   min_timeslice_us_store);
+static DEVICE_ATTR(tsg_timeslice_min_us, ROOTRW, tsg_timeslice_min_us_read,
+		   tsg_timeslice_min_us_store);
 
-static ssize_t max_timeslice_us_read(struct device *dev,
+static ssize_t tsg_timeslice_max_us_read(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
 	struct gk20a *g = get_gk20a(dev);
 
-	return snprintf(buf, PAGE_SIZE, "%u\n", g->max_timeslice_us);
+	return snprintf(buf, NVGPU_CPU_PAGE_SIZE, "%u\n", g->tsg_timeslice_max_us);
 }
 
-static ssize_t max_timeslice_us_store(struct device *dev,
+static ssize_t tsg_timeslice_max_us_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct gk20a *g = get_gk20a(dev);
@@ -969,163 +1032,16 @@ static ssize_t max_timeslice_us_store(struct device *dev,
 	if (kstrtoul(buf, 10, &val) < 0)
 		return -EINVAL;
 
-	if (val < g->min_timeslice_us)
+	if (val < g->tsg_timeslice_min_us)
 		return -EINVAL;
 
-	g->max_timeslice_us = val;
+	g->tsg_timeslice_max_us = val;
 
 	return count;
 }
 
-static DEVICE_ATTR(max_timeslice_us, ROOTRW, max_timeslice_us_read,
-		   max_timeslice_us_store);
-
-static ssize_t czf_bypass_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct gk20a *g = get_gk20a(dev);
-	unsigned long val;
-
-	if (kstrtoul(buf, 10, &val) < 0)
-		return -EINVAL;
-
-	if (val >= 4)
-		return -EINVAL;
-
-	g->gr.czf_bypass = val;
-
-	return count;
-}
-
-static ssize_t czf_bypass_read(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct gk20a *g = get_gk20a(dev);
-
-	return sprintf(buf, "%d\n", g->gr.czf_bypass);
-}
-
-static DEVICE_ATTR(czf_bypass, ROOTRW, czf_bypass_read, czf_bypass_store);
-
-static ssize_t pd_max_batches_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct gk20a *g = get_gk20a(dev);
-	unsigned long val;
-
-	if (kstrtoul(buf, 10, &val) < 0)
-		return -EINVAL;
-
-	if (val > 64)
-		return -EINVAL;
-
-	g->gr.pd_max_batches = val;
-
-	return count;
-}
-
-static ssize_t pd_max_batches_read(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct gk20a *g = get_gk20a(dev);
-
-	return sprintf(buf, "%d\n", g->gr.pd_max_batches);
-}
-
-static DEVICE_ATTR(pd_max_batches, ROOTRW, pd_max_batches_read, pd_max_batches_store);
-
-static ssize_t gfxp_wfi_timeout_count_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct gk20a *g = get_gk20a(dev);
-	struct gr_gk20a *gr = &g->gr;
-	unsigned long val = 0;
-	int err = -1;
-
-	if (kstrtoul(buf, 10, &val) < 0)
-		return -EINVAL;
-
-	if (g->ops.gr.get_max_gfxp_wfi_timeout_count) {
-		if (val >= g->ops.gr.get_max_gfxp_wfi_timeout_count(g))
-			return -EINVAL;
-	}
-
-	gr->gfxp_wfi_timeout_count = val;
-
-	if (g->ops.gr.init_preemption_state && g->power_on) {
-		err = gk20a_busy(g);
-		if (err)
-			return err;
-
-		err = gr_gk20a_elpg_protected_call(g,
-			g->ops.gr.init_preemption_state(g));
-
-		gk20a_idle(g);
-
-		if (err)
-			return err;
-	}
-	return count;
-}
-
-static ssize_t gfxp_wfi_timeout_unit_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct gk20a *g = get_gk20a(dev);
-	struct gr_gk20a *gr = &g->gr;
-	int err = -1;
-
-	if (count > 0 && buf[0] == 's')
-		/* sysclk */
-		gr->gfxp_wfi_timeout_unit = GFXP_WFI_TIMEOUT_UNIT_SYSCLK;
-	else
-		/* usec */
-		gr->gfxp_wfi_timeout_unit = GFXP_WFI_TIMEOUT_UNIT_USEC;
-
-	if (g->ops.gr.init_preemption_state && g->power_on) {
-		err = gk20a_busy(g);
-		if (err)
-			return err;
-
-		err = gr_gk20a_elpg_protected_call(g,
-			g->ops.gr.init_preemption_state(g));
-
-		gk20a_idle(g);
-
-		if (err)
-			return err;
-	}
-
-	return count;
-}
-
-static ssize_t gfxp_wfi_timeout_count_read(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct gk20a *g = get_gk20a(dev);
-	struct gr_gk20a *gr = &g->gr;
-	u32 val = gr->gfxp_wfi_timeout_count;
-
-	return snprintf(buf, PAGE_SIZE, "%d\n", val);
-}
-
-static ssize_t gfxp_wfi_timeout_unit_read(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct gk20a *g = get_gk20a(dev);
-	struct gr_gk20a *gr = &g->gr;
-
-	if (gr->gfxp_wfi_timeout_unit == GFXP_WFI_TIMEOUT_UNIT_USEC)
-		return snprintf(buf, PAGE_SIZE, "usec\n");
-	else
-		return snprintf(buf, PAGE_SIZE, "sysclk\n");
-}
-
-static DEVICE_ATTR(gfxp_wfi_timeout_count, (S_IRWXU|S_IRGRP|S_IROTH),
-		gfxp_wfi_timeout_count_read, gfxp_wfi_timeout_count_store);
-
-static DEVICE_ATTR(gfxp_wfi_timeout_unit, (S_IRWXU|S_IRGRP|S_IROTH),
-		gfxp_wfi_timeout_unit_read, gfxp_wfi_timeout_unit_store);
+static DEVICE_ATTR(tsg_timeslice_max_us, ROOTRW, tsg_timeslice_max_us_read,
+		   tsg_timeslice_max_us_store);
 
 static ssize_t comptag_mem_deduct_store(struct device *dev,
 					struct device_attribute *attr,
@@ -1143,9 +1059,9 @@ static ssize_t comptag_mem_deduct_store(struct device *dev,
 		return -EINVAL;
 	}
 
-	g->gr.comptag_mem_deduct = val;
+	g->comptag_mem_deduct = val;
 	/* Deduct the part taken by the running system */
-	g->gr.max_comptag_mem -= val;
+	g->max_comptag_mem -= val;
 
 	return count;
 }
@@ -1155,11 +1071,108 @@ static ssize_t comptag_mem_deduct_show(struct device *dev,
 {
 	struct gk20a *g = get_gk20a(dev);
 
-	return sprintf(buf, "%d\n", g->gr.comptag_mem_deduct);
+	return sprintf(buf, "%d\n", g->comptag_mem_deduct);
 }
 
 static DEVICE_ATTR(comptag_mem_deduct, ROOTRW,
 		   comptag_mem_deduct_show, comptag_mem_deduct_store);
+
+#ifdef CONFIG_NVGPU_MIG
+static ssize_t mig_mode_config_list_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	u32 config_id = 0;
+	int res = 0;
+	u32 num_config = 0;
+	struct gk20a *g = get_gk20a(dev);
+	const struct nvgpu_mig_gpu_instance_config *mig_gpu_instance_config;
+	const char *power_on_string = "MIG list will be displayed after gpu power"
+		" on with default MIG mode \n Boot with config id zero\n"
+		" Get the available configs \n"
+		" Change the init script and reboot";
+	const char *error_on_nullconfig = "MIG list can't be displayed";
+
+	if (nvgpu_is_powered_on(g)) {
+		mig_gpu_instance_config =
+			(g->ops.grmgr.get_mig_config_ptr != NULL) ?
+			g->ops.grmgr.get_mig_config_ptr(g) : NULL;
+		if (mig_gpu_instance_config == NULL) {
+			res += sprintf(&buf[res], "MIG is %s", nvgpu_is_enabled(g, NVGPU_SUPPORT_MIG) ?
+					"enabled\n" : "disabled\n");
+			res += scnprintf(&buf[res], (PAGE_SIZE - res - 1),"%s", error_on_nullconfig);
+			res += scnprintf(&buf[res], (PAGE_SIZE - res - 1), " for : %s\n",
+					g->name);
+			return res;
+		}
+	} else {
+		res += sprintf(&buf[res], "%s", power_on_string);
+		return res;
+	}
+
+	num_config = mig_gpu_instance_config->num_config_supported;
+	if (!nvgpu_is_enabled(g, NVGPU_SUPPORT_MIG)) {
+		res += sprintf(&buf[res], "\n  MIG not enabled for %s \n", g->name);
+	}
+
+	res += scnprintf(&buf[res], (PAGE_SIZE - res - 1),
+		"\n+++++++++ Config list Start ++++++++++\n");
+	for (config_id = 0U; config_id < num_config; config_id++) {
+		res += scnprintf(&buf[res], (PAGE_SIZE - res - 1),
+			"\n CONFIG_ID : %d for CONFIG NAME : %s\n",
+			config_id,
+			mig_gpu_instance_config->gpu_instance_config[config_id].config_name);
+	}
+
+	res += sprintf(&buf[res], "\n++++++++++ Config list End +++++++++++\n");
+	return res;
+}
+
+static DEVICE_ATTR(mig_mode_config_list, S_IRUGO,
+		   mig_mode_config_list_show, NULL);
+
+static ssize_t mig_mode_config_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct gk20a *g = get_gk20a(dev);
+	unsigned long val;
+	/*currently we are supporting maximum 16 */
+	unsigned long supported_max_config = 16U;
+
+	if (kstrtoul(buf, 10, &val) < 0) {
+		return -EINVAL;
+	}
+
+	if (nvgpu_is_powered_on(g)) {
+		nvgpu_err(g, "GPU is powered on already, MIG mode"
+				"cant be changed");
+		return -EINVAL;
+	}
+
+	if (val <= supported_max_config) {
+		g->mig.current_gpu_instance_config_id = val;
+		nvgpu_set_enabled(g, NVGPU_SUPPORT_MIG, true);
+		nvgpu_info(g, "MIG config changed successfully");
+	} else {
+		nvgpu_err(g, "Please select a supported config id < 16");
+		nvgpu_set_enabled(g, NVGPU_SUPPORT_MIG,false);
+	}
+
+	return count;
+}
+
+static ssize_t mig_mode_config_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	struct gk20a *g = get_gk20a(dev);
+
+	return sprintf(buf, "%x\n", g->mig.current_gpu_instance_config_id);
+}
+
+static DEVICE_ATTR(mig_mode_config, ROOTRW,
+		   mig_mode_config_show, mig_mode_config_store);
+
+#endif
 
 void nvgpu_remove_sysfs(struct device *dev)
 {
@@ -1190,26 +1203,33 @@ void nvgpu_remove_sysfs(struct device *dev)
 	device_remove_file(dev, &dev_attr_allow_all);
 	device_remove_file(dev, &dev_attr_tpc_fs_mask);
 	device_remove_file(dev, &dev_attr_tpc_pg_mask);
-	device_remove_file(dev, &dev_attr_min_timeslice_us);
-	device_remove_file(dev, &dev_attr_max_timeslice_us);
+	device_remove_file(dev, &dev_attr_tsg_timeslice_min_us);
+	device_remove_file(dev, &dev_attr_tsg_timeslice_max_us);
 
 #ifdef CONFIG_TEGRA_GK20A_NVHOST
 	nvgpu_nvhost_remove_symlink(get_gk20a(dev));
 #endif
 
-	device_remove_file(dev, &dev_attr_czf_bypass);
-	device_remove_file(dev, &dev_attr_pd_max_batches);
-	device_remove_file(dev, &dev_attr_gfxp_wfi_timeout_count);
-	device_remove_file(dev, &dev_attr_gfxp_wfi_timeout_unit);
 	device_remove_file(dev, &dev_attr_gpu_powered_on);
 
 	device_remove_file(dev, &dev_attr_comptag_mem_deduct);
-
+#ifdef CONFIG_NVGPU_MIG
+	device_remove_file(dev, &dev_attr_mig_mode_config_list);
+	device_remove_file(dev, &dev_attr_mig_mode_config);
+#endif
 	if (strcmp(dev_name(dev), "gpu.0")) {
 		struct kobject *kobj = &dev->kobj;
 		struct device *parent = container_of((kobj->parent),
 				struct device, kobj);
 		sysfs_remove_link(&parent->kobj, "gpu.0");
+
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 14, 0)
+		kobj = &parent->kobj;
+		parent = container_of((kobj->parent),
+				struct device, kobj);
+		sysfs_remove_link(&parent->kobj, "gpu.0");
+		sysfs_remove_link(&parent->kobj, dev_name(dev));
+#endif
 	}
 }
 
@@ -1245,27 +1265,41 @@ int nvgpu_create_sysfs(struct device *dev)
 	error |= device_create_file(dev, &dev_attr_allow_all);
 	error |= device_create_file(dev, &dev_attr_tpc_fs_mask);
 	error |= device_create_file(dev, &dev_attr_tpc_pg_mask);
-	error |= device_create_file(dev, &dev_attr_min_timeslice_us);
-	error |= device_create_file(dev, &dev_attr_max_timeslice_us);
+	error |= device_create_file(dev, &dev_attr_tsg_timeslice_min_us);
+	error |= device_create_file(dev, &dev_attr_tsg_timeslice_max_us);
 
 #ifdef CONFIG_TEGRA_GK20A_NVHOST
 	error |= nvgpu_nvhost_create_symlink(g);
 #endif
 
-	error |= device_create_file(dev, &dev_attr_czf_bypass);
-	error |= device_create_file(dev, &dev_attr_pd_max_batches);
-	error |= device_create_file(dev, &dev_attr_gfxp_wfi_timeout_count);
-	error |= device_create_file(dev, &dev_attr_gfxp_wfi_timeout_unit);
 	error |= device_create_file(dev, &dev_attr_gpu_powered_on);
 
 	error |= device_create_file(dev, &dev_attr_comptag_mem_deduct);
-
+#ifdef CONFIG_NVGPU_MIG
+	error |= device_create_file(dev, &dev_attr_mig_mode_config_list);
+	error |= device_create_file(dev, &dev_attr_mig_mode_config);
+#endif
 	if (strcmp(dev_name(dev), "gpu.0")) {
 		struct kobject *kobj = &dev->kobj;
 		struct device *parent = container_of((kobj->parent),
 					struct device, kobj);
 		error |= sysfs_create_link(&parent->kobj,
 				   &dev->kobj, "gpu.0");
+
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 14, 0)
+		/*
+		 * Create symbolic link under /sys/devices/ as various tests
+		 * expect it to be there. Above sysfs_create_link creates
+		 * it under /sys/devices/platform/ from kernels after v4.14.
+		 */
+		kobj = &parent->kobj;
+		parent = container_of((kobj->parent),
+					struct device, kobj);
+		error |= sysfs_create_link(&parent->kobj,
+				   &dev->kobj, "gpu.0");
+		error |= sysfs_create_link(&parent->kobj,
+				   &dev->kobj, dev_name(dev));
+#endif
 	}
 
 	if (error)

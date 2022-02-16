@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2018-2021, NVIDIA CORPORATION.  All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -26,14 +26,19 @@
  */
 
 #include <nvgpu/ecc.h>
-#include <nvgpu/ltc.h>
+#include <nvgpu/debugger.h>
+#include <nvgpu/cic.h>
+#include <nvgpu/types.h>
 
-#include "gk20a/dbg_gpu_gk20a.h"
+struct gk20a;
 
+#ifdef CONFIG_NVGPU_DEBUGGER
 void nvgpu_dbg_session_post_event(struct dbg_session_gk20a *dbg_s)
 {
 }
+#endif
 
+#ifdef CONFIG_NVGPU_SYSFS
 int nvgpu_ecc_sysfs_init(struct gk20a *g)
 {
 	return 0;
@@ -42,9 +47,10 @@ int nvgpu_ecc_sysfs_init(struct gk20a *g)
 void nvgpu_ecc_sysfs_remove(struct gk20a *g)
 {
 }
+#endif
 
-int nvgpu_ltc_alloc_cbc(struct gk20a *g, size_t compbit_backing_size,
-			bool vidmem_alloc)
+int nvgpu_cic_report_err_safety_services(struct gk20a *g,
+		void *err_info, size_t err_size, bool is_critical)
 {
 	return 0;
 }

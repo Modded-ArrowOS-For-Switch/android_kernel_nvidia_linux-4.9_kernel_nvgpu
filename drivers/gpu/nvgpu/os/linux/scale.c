@@ -18,15 +18,17 @@
 
 #include <linux/devfreq.h>
 #include <linux/export.h>
-#include <soc/tegra/chip-id.h>
 #include <linux/pm_qos.h>
+#include <linux/version.h>
 
 #include <governor.h>
 
 #include <nvgpu/kmem.h>
 #include <nvgpu/log.h>
 #include <nvgpu/gk20a.h>
+#include <nvgpu/pmu/clk/clk.h>
 #include <nvgpu/clk_arb.h>
+#include <nvgpu/pmu/pmu_perfmon.h>
 
 #include "platform_gk20a.h"
 #include "scale.h"
@@ -148,9 +150,11 @@ static int gk20a_scale_target(struct device *dev, unsigned long *freq,
 {
 	struct gk20a_platform *platform = dev_get_drvdata(dev);
 	struct gk20a *g = platform->g;
-	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
 	struct gk20a_scale_profile *profile = g->scale_profile;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
+	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
 	struct devfreq *devfreq = l->devfreq;
+#endif
 	unsigned long local_freq = *freq;
 	unsigned long rounded_rate;
 	unsigned long min_freq = 0, max_freq = 0;
@@ -172,8 +176,18 @@ static int gk20a_scale_target(struct device *dev, unsigned long *freq,
 	 * In case we have conflict (min_freq > max_freq) after above
 	 * steps, we ensure that max_freq wins over min_freq
 	 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
 	min_freq = max_t(u32, devfreq->min_freq, profile->qos_min_freq);
 	max_freq = min_t(u32, devfreq->max_freq, profile->qos_max_freq);
+#else
+	/*
+	 * devfreq takes care of min/max freq clipping in update_devfreq() then
+	 * invoked devfreq->profile->target(), thus we only need to do freq
+	 * clipping based on pm_qos constraint
+	 */
+	min_freq = profile->qos_min_freq;
+	max_freq = profile->qos_max_freq;
+#endif
 
 	if (min_freq > max_freq)
 		min_freq = max_freq;
@@ -319,6 +333,46 @@ static int get_cur_freq(struct device *dev, unsigned long *freq)
 	return 0;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
+static int register_gpu_opp(struct device *dev)
+{
+	return 0;
+}
+
+static void unregister_gpu_opp(struct device *dev)
+{
+}
+#else
+static void unregister_gpu_opp(struct device *dev)
+{
+	dev_pm_opp_remove_all_dynamic(dev);
+}
+
+static int register_gpu_opp(struct device *dev)
+{
+	struct gk20a_platform *platform = dev_get_drvdata(dev);
+	struct gk20a *g = platform->g;
+	struct gk20a_scale_profile *profile = g->scale_profile;
+	unsigned long *freq_table = profile->devfreq_profile.freq_table;
+	int max_states = profile->devfreq_profile.max_state;
+	int i;
+	int err = 0;
+
+	for (i = 0; i < max_states; ++i) {
+		err = dev_pm_opp_add(dev, freq_table[i], 0);
+		if (err) {
+			nvgpu_err(g,
+				"Failed to add OPP %lu: %d\n",
+				freq_table[i],
+				err);
+			unregister_gpu_opp(dev);
+			break;
+		}
+	}
+
+	return err;
+}
+#endif
 
 /*
  * gk20a_scale_init(dev)
@@ -359,6 +413,9 @@ void gk20a_scale_init(struct device *dev)
 
 	if (platform->devfreq_governor) {
 		struct devfreq *devfreq;
+		int error = 0;
+
+		register_gpu_opp(dev);
 
 		profile->devfreq_profile.initial_freq =
 			profile->devfreq_profile.freq_table[0];
@@ -368,14 +425,26 @@ void gk20a_scale_init(struct device *dev)
 		profile->devfreq_profile.get_cur_freq = get_cur_freq;
 		profile->devfreq_profile.polling_ms = 25;
 
-		devfreq = devm_devfreq_add_device(dev,
+		devfreq = devfreq_add_device(dev,
 					&profile->devfreq_profile,
 					platform->devfreq_governor, NULL);
 
-		if (IS_ERR_OR_NULL(devfreq))
+		if (IS_ERR(devfreq))
 			devfreq = NULL;
 
 		l->devfreq = devfreq;
+
+		/* create symlink /sys/devices/gpu.0/devfreq_dev */
+		if (devfreq != NULL) {
+			error = sysfs_create_link(&dev->kobj,
+				&devfreq->dev.kobj, "devfreq_dev");
+
+			if (error) {
+				nvgpu_err(g,
+					"Failed to create devfreq_dev: %d",
+					error);
+			}
+		}
 	}
 
 #ifdef CONFIG_GK20A_PM_QOS
@@ -401,6 +470,8 @@ void gk20a_scale_exit(struct device *dev)
 {
 	struct gk20a_platform *platform = dev_get_drvdata(dev);
 	struct gk20a *g = platform->g;
+	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
+	int err;
 
 #ifdef CONFIG_GK20A_PM_QOS
 	if (platform->qos_notify) {
@@ -410,6 +481,15 @@ void gk20a_scale_exit(struct device *dev)
 				&g->scale_profile->qos_notify_block);
 	}
 #endif
+
+	if (platform->devfreq_governor) {
+		sysfs_remove_link(&dev->kobj, "devfreq_dev");
+
+		err = devfreq_remove_device(l->devfreq);
+		l->devfreq = NULL;
+
+		unregister_gpu_opp(dev);
+	}
 
 	nvgpu_kfree(g, g->scale_profile);
 	g->scale_profile = NULL;

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017-2018, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2017-2021, NVIDIA CORPORATION.  All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -25,67 +25,98 @@
 
 #ifdef __KERNEL__
 #include <nvgpu/linux/thread.h>
-#elif defined(__NVGPU_POSIX__)
-#include <nvgpu/posix/thread.h>
 #else
-#include <nvgpu_rmos/include/thread.h>
+#include <nvgpu/posix/thread.h>
 #endif
 
 #include <nvgpu/types.h>
+#include <nvgpu/utils.h>
 
 /**
- * nvgpu_thread_create - Create and run a new thread.
- *
- * @thread - thread structure to use
- * @data - data to pass to threadfn
- * @threadfn - Thread function
- * @name - name of the thread
+ * @brief Create and run a new thread.
  *
  * Create a thread and run threadfn in it. The thread stays alive as long as
  * threadfn is running. As soon as threadfn returns the thread is destroyed.
+ * The threadfn needs to continuously poll #nvgpu_thread_should_stop() to
+ * determine if it should exit.
  *
- * threadfn needs to continuously poll nvgpu_thread_should_stop() to determine
- * if it should exit.
+ * @param thread [in]	Thread structure to use.
+ * @param data [in]	Data to pass to threadfn.
+ * @param threadfn [in]	Thread function.
+ * @param name [in]	Name of the thread.
+ *
+ * @return Return 0 on success, otherwise returns error number to indicate the
+ * error.
+ *
+ * @retval EINVAL invalid thread attribute object.
+ * @retval EAGAIN insufficient system resources to create thread.
+ * @retval EFAULT error occurred trying to access the buffers or the
+ * start routine provided for thread creation.
  */
 int nvgpu_thread_create(struct nvgpu_thread *thread,
 		void *data,
 		int (*threadfn)(void *data), const char *name);
 
 /**
- * nvgpu_thread_stop - Destroy or request to destroy a thread
+ * @brief Stop a thread.
  *
- * @thread - thread to stop
+ * A thread can be requested to stop by calling this function. This function
+ * places a request to cancel the corresponding thread by setting a status and
+ * waits until that thread exits.
  *
- * Request a thread to stop by setting nvgpu_thread_should_stop() to
- * true and wait for thread to exit.
+ * @param thread [in]	Thread to stop.
  */
 void nvgpu_thread_stop(struct nvgpu_thread *thread);
 
 /**
- * nvgpu_thread_should_stop - Query if thread should stop
+ * @brief Request a thread to be stopped gracefully.
  *
- * @thread
+ * Request a thread to stop by setting the status of the thread appropriately.
+ * In posix implementation, the callback function \a thread_stop_fn is invoked
+ * and waits till the thread exits.
+ *
+ * @param thread [in]		Thread to stop.
+ * @param thread_stop_fn [in]	Callback function to trigger graceful exit.
+ * @param data [in]		Thread data.
+ */
+void nvgpu_thread_stop_graceful(struct nvgpu_thread *thread,
+		void (*thread_stop_fn)(void *data), void *data);
+
+/**
+ * @brief Query if thread should stop.
  *
  * Return true if thread should exit. Can be run only in the thread's own
- * context and with the thread as parameter.
+ * context.
+ *
+ * @param thread [in]	Thread to be queried for stop status.
+ *
+ * @return Boolean value which indicates if the thread has to stop or not.
+ *
+ * @retval TRUE if the thread should stop.
+ * @retval FALSE if the thread need not stop.
  */
 bool nvgpu_thread_should_stop(struct nvgpu_thread *thread);
 
 /**
- * nvgpu_thread_is_running - Query if thread is running
+ * @brief Query if thread is running.
  *
- * @thread
+ * Returns a boolean value based on the current running status of the thread.
  *
- * Return true if thread is started.
+ * @param thread [in]	Thread to be queried for running status.
+ *
+ * @return TRUE if the current running status of the thread is 1, else FALSE.
+ *
+ * @retval TRUE if the thread is running.
+ * @retval FALSE if the thread is not running.
  */
 bool nvgpu_thread_is_running(struct nvgpu_thread *thread);
 
 /**
- * nvgpu_thread_join - join a thread to reclaim resources
- * after it has exited
+ * @brief Join a thread to reclaim resources after it has exited.
  *
- * @thread - thread to join
+ * The calling thread waits till the thread referenced by \a thread exits.
  *
+ * @param thread [in] - Thread to join.
  */
 void nvgpu_thread_join(struct nvgpu_thread *thread);
 

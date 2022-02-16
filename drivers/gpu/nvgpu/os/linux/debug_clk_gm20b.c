@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2017-2018 NVIDIA Corporation.  All rights reserved.
+ * Copyright (C) 2017-2020 NVIDIA Corporation.  All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -18,8 +18,9 @@
 
 #include <nvgpu/io.h>
 #include <nvgpu/clk_arb.h>
+#include <nvgpu/pmu/clk/clk.h>
 
-#include "gm20b/clk_gm20b.h"
+#include "hal/clk/clk_gm20b.h"
 #include "os_linux.h"
 #include "platform_gk20a.h"
 
@@ -262,15 +263,11 @@ int gm20b_clk_init_debugfs(struct gk20a *g)
 	if (!d)
 		goto err_out;
 
-	d = debugfs_create_u32("pll_na_mode", S_IRUGO, l->debugfs,
+	debugfs_create_u32("pll_na_mode", S_IRUGO, l->debugfs,
 			       (u32 *)&g->clk.gpc_pll.mode);
-	if (!d)
-		goto err_out;
 
-	d = debugfs_create_u32("fmax2x_at_vmin_safe_t", S_IRUGO,
+	debugfs_create_u32("fmax2x_at_vmin_safe_t", S_IRUGO,
 		       l->debugfs, (u32 *)&g->clk.dvfs_safe_max_freq);
-	if (!d)
-		goto err_out;
 
 	return 0;
 

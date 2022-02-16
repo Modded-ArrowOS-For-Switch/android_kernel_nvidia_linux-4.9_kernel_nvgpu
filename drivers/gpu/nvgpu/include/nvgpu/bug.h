@@ -24,6 +24,12 @@
 
 #ifdef __KERNEL__
 #include <linux/bug.h>
+#else
+#include <nvgpu/posix/bug.h>
+#endif
+#include <nvgpu/cov_whitelist.h>
+#include <nvgpu/list.h>
+
 /*
  * Define an assert macro that code within nvgpu can use.
  *
@@ -37,15 +43,69 @@
  *
  * As a result this macro varies depending on platform.
  */
+#if defined(__KERNEL__)
 #define nvgpu_assert(cond)	((void) WARN_ON(!(cond)))
+#else
+/*
+ * When this assert fails, the function will not return.
+ */
+#define nvgpu_assert(cond)											\
+	({													\
+		NVGPU_COV_WHITELIST_BLOCK_BEGIN(false_positive, 1, NVGPU_MISRA(Rule, 14_4), "Bug 2277532")	\
+		NVGPU_COV_WHITELIST_BLOCK_BEGIN(false_positive, 1, NVGPU_MISRA(Rule, 15_6), "Bug 2277532")	\
+		BUG_ON((cond) == ((bool)(0 != 0)));										\
+		NVGPU_COV_WHITELIST_BLOCK_END(NVGPU_MISRA(Rule, 14_4))						\
+		NVGPU_COV_WHITELIST_BLOCK_END(NVGPU_MISRA(Rule, 15_6))						\
+	})
+#endif
+
+/*
+ * Define simple macros to force the consequences of a failed assert
+ * (presumably done in a previous if statement).
+ * The exact behavior will be OS dependent. See above.
+ */
+#define nvgpu_do_assert()						\
+NVGPU_COV_WHITELIST(false_positive, NVGPU_MISRA(Rule, 10_3), "Bug 2623654") \
+	nvgpu_assert((bool)(0 != 0))
+
+/*
+ * Define compile-time assert check.
+ */
+#define ASSERT_CONCAT(a, b) a##b
+#define ASSERT_ADD_INFO(a, b) ASSERT_CONCAT(a, b)
+#define nvgpu_static_assert(e)						\
+	enum {								\
+		ASSERT_ADD_INFO(assert_line_, __LINE__) = 1 / (!!(e))	\
+	}
+
+struct gk20a;
+
 #define nvgpu_do_assert_print(g, fmt, arg...)				\
 	do {								\
 		nvgpu_err(g, fmt, ##arg);				\
+		nvgpu_do_assert();					\
 	} while (false)
-#elif defined(__NVGPU_POSIX__)
-#include <nvgpu/posix/bug.h>
-#else
-#include <nvgpu_rmos/include/bug.h>
+
+
+struct nvgpu_bug_cb
+{
+	void (*cb)(void *arg);
+	void *arg;
+	struct nvgpu_list_node node;
+	bool sw_quiesce_data;
+};
+
+static inline struct nvgpu_bug_cb *
+nvgpu_bug_cb_from_node(struct nvgpu_list_node *node)
+{
+	return (struct nvgpu_bug_cb *)
+		((uintptr_t)node - offsetof(struct nvgpu_bug_cb, node));
+};
+
+#ifdef __KERNEL__
+static inline void nvgpu_bug_exit(int status) { }
+static inline void nvgpu_bug_register_cb(struct nvgpu_bug_cb *cb) { }
+static inline void nvgpu_bug_unregister_cb(struct nvgpu_bug_cb *cb) { }
 #endif
 
 #endif /* NVGPU_BUG_H */

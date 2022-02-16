@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018 NVIDIA Corporation.  All rights reserved.
+ * Copyright (C) 2018-2019 NVIDIA Corporation.  All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -16,6 +16,7 @@
 #include "os_linux.h"
 
 #include <nvgpu/gk20a.h>
+#include <nvgpu/nvgpu_init.h>
 
 #include <linux/debugfs.h>
 #include <linux/uaccess.h>
@@ -45,7 +46,7 @@ static ssize_t ltc_intr_illegal_compstat_write(struct file *file,
 	struct gk20a *g = file->private_data;
 	int err;
 
-	if (!g->ops.ltc.intr_en_illegal_compstat)
+	if (!g->ops.ltc.intr.en_illegal_compstat)
 		return -EINVAL;
 
 	buf_size = min(count, (sizeof(buf)-1));
@@ -57,7 +58,7 @@ static ssize_t ltc_intr_illegal_compstat_write(struct file *file,
 		return err;
 
 	if (strtobool(buf, &intr_illegal_compstat_enabled) == 0) {
-		g->ops.ltc.intr_en_illegal_compstat(g,
+		g->ops.ltc.intr.en_illegal_compstat(g,
 				intr_illegal_compstat_enabled);
 		g->ltc_intr_en_illegal_compstat = intr_illegal_compstat_enabled;
 	}

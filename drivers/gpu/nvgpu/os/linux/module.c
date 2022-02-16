@@ -26,30 +26,42 @@
 #include <linux/reset.h>
 #include <linux/reboot.h>
 #include <linux/notifier.h>
+#ifdef CONFIG_NVGPU_VPR
 #include <linux/platform/tegra/common.h>
+#endif
 #include <linux/pci.h>
+#include <linux/of_gpio.h>
 
 #include <uapi/linux/nvgpu.h>
+#ifdef CONFIG_NVGPU_TEGRA_FUSE
 #include <dt-bindings/soc/gm20b-fuse.h>
 #include <dt-bindings/soc/gp10b-fuse.h>
 #include <dt-bindings/soc/gv11b-fuse.h>
 
 #include <soc/tegra/fuse.h>
+#endif /* CONFIG_NVGPU_TEGRA_FUSE */
 
-#include <nvgpu/hal_init.h>
 #include <nvgpu/dma.h>
 #include <nvgpu/kmem.h>
 #include <nvgpu/nvgpu_common.h>
 #include <nvgpu/soc.h>
+#include <nvgpu/fbp.h>
 #include <nvgpu/enabled.h>
+#include <nvgpu/errata.h>
 #include <nvgpu/debug.h>
-#include <nvgpu/ctxsw_trace.h>
 #include <nvgpu/vidmem.h>
 #include <nvgpu/sim.h>
 #include <nvgpu/clk_arb.h>
 #include <nvgpu/timers.h>
+#include <nvgpu/engines.h>
 #include <nvgpu/channel.h>
-#include <nvgpu/nvgpu_err.h>
+#include <nvgpu/gr/gr.h>
+#include <nvgpu/gr/gr_utils.h>
+#include <nvgpu/pmu/pmu_pstate.h>
+#include <nvgpu/cyclestats_snapshot.h>
+#include <nvgpu/nvgpu_init.h>
+#include <nvgpu/mc.h>
+#include <nvgpu/cic.h>
 
 #include "platform_gk20a.h"
 #include "sysfs.h"
@@ -57,36 +69,69 @@
 #include "scale.h"
 #include "pci.h"
 #include "module.h"
+
 #include "module_usermode.h"
-#include "intr.h"
 #include "ioctl.h"
 #include "ioctl_ctrl.h"
 
 #include "os_linux.h"
 #include "os_ops.h"
-#include "ctxsw_trace.h"
+#include "fecs_trace_linux.h"
 #include "driver_common.h"
 #include "channel.h"
 #include "debug_pmgr.h"
+#include "dmabuf_priv.h"
 
 #ifdef CONFIG_NVGPU_SUPPORT_CDE
 #include "cde.h"
 #endif
 
-#define CLASS_NAME "nvidia-gpu"
-/* TODO: Change to e.g. "nvidia-gpu%s" once we have symlinks in place. */
+#if defined(CONFIG_NVGPU_NEXT) && defined(CONFIG_NVGPU_NON_FUSA)
+#include "nvgpu_next_gpuid.h"
+#endif
 
 #define GK20A_WAIT_FOR_IDLE_MS	2000
 
 #define CREATE_TRACE_POINTS
-#include <trace/events/gk20a.h>
+#include <nvgpu/trace.h>
+
+static int nvgpu_wait_for_idle(struct gk20a *g)
+{
+	int wait_length = 150; /* 3 second overall max wait. */
+	int target_usage_count = 0;
+	bool done = false;
+
+	if (g == NULL) {
+		return -ENODEV;
+	}
+
+	do {
+		if (nvgpu_atomic_read(&g->usage_count) == target_usage_count) {
+			done = true;
+		} else if (wait_length-- < 0) {
+			done = true;
+		} else {
+			nvgpu_msleep(20);
+		}
+	} while (!done);
+
+	if (wait_length < 0) {
+		nvgpu_warn(g, "Timed out waiting for idle (%d)!\n",
+			   nvgpu_atomic_read(&g->usage_count));
+		return -ETIMEDOUT;
+	}
+
+	return 0;
+}
 
 static int nvgpu_kernel_shutdown_notification(struct notifier_block *nb,
 					unsigned long event, void *unused)
 {
-	struct gk20a *g = container_of(nb, struct gk20a, nvgpu_reboot_nb);
+	struct nvgpu_os_linux *l = container_of(nb, struct nvgpu_os_linux,
+						nvgpu_reboot_nb);
+	struct gk20a *g = &l->g;
 
-	__nvgpu_set_enabled(g, NVGPU_KERNEL_IS_DYING, true);
+	nvgpu_set_enabled(g, NVGPU_KERNEL_IS_DYING, true);
 	return NOTIFY_DONE;
 }
 
@@ -109,22 +154,6 @@ struct device_node *nvgpu_get_node(struct gk20a *g)
 void gk20a_busy_noresume(struct gk20a *g)
 {
 	pm_runtime_get_noresume(dev_from_gk20a(g));
-}
-
-/*
- * Check if the device can go busy.
- */
-static int nvgpu_can_busy(struct gk20a *g)
-{
-	/* Can't do anything if the system is rebooting/shutting down. */
-	if (nvgpu_is_enabled(g, NVGPU_KERNEL_IS_DYING))
-		return 0;
-
-	/* Can't do anything if the driver is restarting. */
-	if (nvgpu_is_enabled(g, NVGPU_DRIVER_IS_DYING))
-		return 0;
-
-	return 1;
 }
 
 int gk20a_busy(struct gk20a *g)
@@ -201,10 +230,8 @@ void gk20a_idle(struct gk20a *g)
  */
 static int gk20a_restore_registers(struct gk20a *g)
 {
-	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
-
-	l->regs = l->regs_saved;
-	l->bar1 = l->bar1_saved;
+	g->regs = g->regs_saved;
+	g->bar1 = g->bar1_saved;
 
 	nvgpu_restore_usermode_registers(g);
 
@@ -219,11 +246,17 @@ int nvgpu_finalize_poweron_linux(struct nvgpu_os_linux *l)
 	if (l->init_done)
 		return 0;
 
-	err = nvgpu_init_channel_support_linux(l);
+	err = nvgpu_channel_init_support_linux(l);
 	if (err) {
 		nvgpu_err(g, "failed to init linux channel support");
 		return err;
 	}
+
+#ifdef CONFIG_NVGPU_FECS_TRACE
+	err = gk20a_ctxsw_trace_init(g);
+	if (err != 0)
+		nvgpu_warn(g, "could not initialize ctxsw tracing");
+#endif
 
 	if (l->ops.clk.init_debugfs) {
 		err = l->ops.clk.init_debugfs(g);
@@ -249,6 +282,22 @@ int nvgpu_finalize_poweron_linux(struct nvgpu_os_linux *l)
 		}
 	}
 
+	if (l->ops.volt.init_debugfs) {
+		err = l->ops.volt.init_debugfs(g);
+		if (err) {
+			nvgpu_err(g, "failed to init linux volt debugfs");
+			return err;
+		}
+	}
+
+	if (l->ops.s_param.init_debugfs) {
+		err = l->ops.s_param.init_debugfs(g);
+		if (err) {
+			nvgpu_err(g, "failed to init linux s_param trace debugfs");
+			return err;
+		}
+	}
+
 	err = nvgpu_pmgr_init_debugfs_linux(l);
 	if (err) {
 		nvgpu_err(g, "failed to init linux pmgr debugfs");
@@ -260,16 +309,96 @@ int nvgpu_finalize_poweron_linux(struct nvgpu_os_linux *l)
 	return 0;
 }
 
-bool gk20a_check_poweron(struct gk20a *g)
+void gk20a_init_linux_characteristics(struct gk20a *g)
 {
-	bool ret;
+	struct device *dev = dev_from_gk20a(g);
 
-	nvgpu_mutex_acquire(&g->power_lock);
-	ret = g->power_on;
-	nvgpu_mutex_release(&g->power_lock);
+	nvgpu_set_enabled(g, NVGPU_SUPPORT_PARTIAL_MAPPINGS, true);
+	nvgpu_set_enabled(g, NVGPU_SUPPORT_DETERMINISTIC_OPTS, true);
+	nvgpu_set_enabled(g, NVGPU_SUPPORT_USERSPACE_MANAGED_AS, true);
+	nvgpu_set_enabled(g, NVGPU_SUPPORT_MAP_ACCESS_TYPE, true);
+
+	if (!IS_ENABLED(CONFIG_NVGPU_SYNCFD_NONE)) {
+		nvgpu_set_enabled(g, NVGPU_SUPPORT_SYNC_FENCE_FDS, true);
+	}
+
+	if (!gk20a_gpu_is_virtual(dev)) {
+		nvgpu_set_enabled(g, NVGPU_SUPPORT_MAPPING_MODIFY, true);
+	}
+}
+
+#ifdef CONFIG_NVGPU_DGPU
+static void therm_alert_work_queue(struct work_struct *work)
+{
+
+	struct dgpu_thermal_alert *thermal_alert =
+		container_of(work, struct dgpu_thermal_alert, work);
+	struct nvgpu_os_linux *l =
+		container_of(thermal_alert, struct nvgpu_os_linux,
+				thermal_alert);
+	struct gk20a *g = &l->g;
+
+	nvgpu_clk_arb_send_thermal_alarm(g);
+	nvgpu_msleep(l->thermal_alert.event_delay * 1000U);
+	enable_irq(l->thermal_alert.therm_alert_irq);
+}
+
+static irqreturn_t therm_irq(int irq, void *dev_id)
+{
+	struct nvgpu_os_linux *l = (struct nvgpu_os_linux *)dev_id;
+
+        disable_irq_nosync(irq);
+        queue_work(l->thermal_alert.workqueue, &l->thermal_alert.work);
+        return IRQ_HANDLED;
+}
+
+static int nvgpu_request_therm_irq(struct nvgpu_os_linux *l)
+{
+	struct device_node *np;
+	int ret = 0, gpio, index = 0;
+	u32 irq_flags = IRQ_TYPE_NONE;
+	u32 event_delay = 10U;
+
+	if (l->thermal_alert.workqueue != NULL) {
+		return ret;
+	}
+	np = of_find_node_by_name(NULL, "nvgpu");
+	if (!np) {
+		return -ENOENT;
+	}
+
+	gpio = of_get_named_gpio(np, "nvgpu-therm-gpios", index);
+	if (gpio < 0) {
+		nvgpu_err(&l->g, "failed to get GPIO %d ", gpio);
+		return gpio;
+	}
+
+	l->thermal_alert.therm_alert_irq = gpio_to_irq(gpio);
+
+	if (of_property_read_u32(np, "alert-interrupt-level", &irq_flags))
+		nvgpu_info(&l->g, "Missing interrupt-level "
+				"prop using %d", irq_flags);
+	if (of_property_read_u32(np, "alert-event-interval", &event_delay))
+		nvgpu_info(&l->g, "Missing event-interval "
+				"prop using %d seconds ", event_delay);
+
+	l->thermal_alert.event_delay = event_delay;
+
+	if (!l->thermal_alert.workqueue) {
+		l->thermal_alert.workqueue = alloc_workqueue("%s",
+					WQ_HIGHPRI, 1, "dgpu_thermal_alert");
+		INIT_WORK(&l->thermal_alert.work, therm_alert_work_queue);
+	}
+
+	ret = devm_request_irq(l->dev, l->thermal_alert.therm_alert_irq ,
+			therm_irq, irq_flags, "dgpu_therm", l);
+	if (ret != 0) {
+		nvgpu_err(&l->g, "IRQ request failed");
+	}
 
 	return ret;
 }
+#endif
 
 int gk20a_pm_finalize_poweron(struct device *dev)
 {
@@ -282,10 +411,14 @@ int gk20a_pm_finalize_poweron(struct device *dev)
 
 	nvgpu_mutex_acquire(&g->power_lock);
 
-	if (g->power_on)
+	if (nvgpu_is_powered_on(g))
 		goto done;
 
+	nvgpu_set_power_state(g, NVGPU_STATE_POWERING_ON);
+
+#ifdef CONFIG_NVGPU_TRACE
 	trace_gk20a_finalize_poweron(dev_name(dev));
+#endif
 
 	/* Increment platform power refcount */
 	if (platform->busy) {
@@ -302,37 +435,78 @@ int gk20a_pm_finalize_poweron(struct device *dev)
 
 	nvgpu_restore_usermode_for_poweron(g);
 
-	/* Enable interrupt workqueue */
-	if (!l->nonstall_work_queue) {
-		l->nonstall_work_queue = alloc_workqueue("%s",
-						WQ_HIGHPRI, 1, "mc_nonstall");
-		INIT_WORK(&l->nonstall_fn_work, nvgpu_intr_nonstall_cb);
+	err = nvgpu_early_poweron(g);
+	if (err != 0) {
+		nvgpu_err(g, "nvgpu_early_poweron failed[%d]", err);
+		goto done;
 	}
 
-	err = nvgpu_detect_chip(g);
-	if (err)
-		goto done;
+	if (!l->dev_nodes_created) {
+		err = gk20a_user_nodes_init(dev);
+		if (err) {
+			goto done;
+		}
+		l->dev_nodes_created = true;
+	}
 
 	if (g->sim) {
 		if (g->sim->sim_init_late)
-			g->sim->sim_init_late(g);
+			err = g->sim->sim_init_late(g);
+		if (err)
+			goto done;
 	}
 
-	err = gk20a_finalize_poweron(g);
+#ifdef CONFIG_NVGPU_DGPU
+	if (nvgpu_is_enabled(g, NVGPU_SUPPORT_DGPU_PCIE_SCRIPT_EXECUTE) &&
+			nvgpu_platform_is_silicon(g)) {
+		g->ops.clk.change_host_clk_source(g);
+		g->ops.xve.devinit_deferred_settings(g);
+	}
+
+	if (nvgpu_is_enabled(g, NVGPU_SUPPORT_DGPU_THERMAL_ALERT) &&
+		nvgpu_platform_is_silicon(g)) {
+		err = nvgpu_request_therm_irq(l);
+		if (err && (err != -ENOENT)) {
+			nvgpu_err(g, "thermal interrupt request failed %d",
+				err);
+			goto done;
+		}
+		if (err == -ENOENT) {
+			nvgpu_info(g, "nvgpu-therm-gpio DT entry is missing. "
+				"Thermal Alert feature will not be enabled");
+		}
+	}
+#endif
+
+	err = nvgpu_enable_irqs(g);
+	if (err) {
+		nvgpu_err(g, "failed to enable irqs %d", err);
+		goto done;
+	}
+
+	err = nvgpu_finalize_poweron(g);
 	if (err)
 		goto done;
+
+	/* Initialize linux specific flags */
+	gk20a_init_linux_characteristics(g);
 
 	err = nvgpu_init_os_linux_ops(l);
 	if (err)
 		goto done;
 
+	nvgpu_init_usermode_support(g);
+
 	err = nvgpu_finalize_poweron_linux(l);
 	if (err)
 		goto done;
 
+#ifdef CONFIG_NVGPU_DGPU
 	nvgpu_init_mm_ce_context(g);
 
 	nvgpu_vidmem_thread_unpause(&g->mm);
+#endif
+
 
 	/* Initialise scaling: it will initialize scaling drive only once */
 	if (IS_ENABLED(CONFIG_GK20A_DEVFREQ) &&
@@ -342,22 +516,15 @@ int gk20a_pm_finalize_poweron(struct device *dev)
 			platform->initscale(dev);
 	}
 
+#ifdef CONFIG_NVGPU_TRACE
 	trace_gk20a_finalize_poweron_done(dev_name(dev));
-
-	enable_irq(g->irq_stall);
-	if (g->irq_stall != g->irq_nonstall)
-		enable_irq(g->irq_nonstall);
-	g->irqs_enabled = 1;
+#endif
 
 	gk20a_scale_resume(dev_from_gk20a(g));
 
 #ifdef CONFIG_NVGPU_SUPPORT_CDE
 	if (platform->has_cde)
 		gk20a_init_cde_support(l);
-#endif
-
-#ifdef CONFIG_NVGPU_SUPPORT_LINUX_ECC_ERROR_REPORTING
-	nvgpu_enable_ecc_reporting(g);
 #endif
 
 	err = gk20a_sched_ctrl_init(g);
@@ -368,13 +535,16 @@ int gk20a_pm_finalize_poweron(struct device *dev)
 
 	g->sw_ready = true;
 
-done:
-	if (err) {
-		g->power_on = false;
+	nvgpu_set_power_state(g, NVGPU_STATE_POWERED_ON);
 
-#ifdef CONFIG_NVGPU_SUPPORT_LINUX_ECC_ERROR_REPORTING
-		nvgpu_disable_ecc_reporting(g);
-#endif
+done:
+	if (err != 0) {
+		nvgpu_disable_irqs(g);
+		nvgpu_remove_sim_support_linux(g);
+		if (l->dev_nodes_created) {
+			gk20a_user_nodes_deinit(dev);
+		}
+		nvgpu_set_power_state(g, NVGPU_STATE_POWERED_OFF);
 	}
 
 	nvgpu_mutex_release(&g->power_lock);
@@ -390,14 +560,103 @@ done:
  */
 static int gk20a_lockout_registers(struct gk20a *g)
 {
-	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
-
-	l->regs = NULL;
-	l->bar1 = NULL;
+	g->regs = 0U;
+	g->bar1 = 0U;
 
 	nvgpu_lockout_usermode_registers(g);
 
 	return 0;
+}
+
+int nvgpu_enable_irqs(struct gk20a *g)
+{
+	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
+	u32 i;
+
+	for (i = 0U; i < l->interrupts.stall_size; i++) {
+		enable_irq(l->interrupts.stall_lines[i]);
+	}
+
+	if (l->interrupts.nonstall_size > 0) {
+		enable_irq(l->interrupts.nonstall_line);
+	}
+
+	return 0;
+}
+
+void nvgpu_disable_irqs(struct gk20a *g)
+{
+	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
+	u32 i;
+
+	for (i = 0U; i < l->interrupts.stall_size; i++) {
+		disable_irq(l->interrupts.stall_lines[i]);
+	}
+
+	if (l->interrupts.nonstall_size > 0) {
+		disable_irq(l->interrupts.nonstall_line);
+	}
+}
+
+void nvgpu_set_power_state(struct gk20a *g, u32 state)
+{
+	unsigned long flags;
+
+	nvgpu_spinlock_irqsave(&g->power_spinlock, flags);
+	g->power_on_state = state;
+	nvgpu_spinunlock_irqrestore(&g->power_spinlock, flags);
+}
+
+const char *nvgpu_get_power_state(struct gk20a *g)
+{
+	unsigned long flags;
+	const char *str = NULL;
+	u32 state;
+
+	nvgpu_spinlock_irqsave(&g->power_spinlock, flags);
+	state = g->power_on_state;
+	nvgpu_spinunlock_irqrestore(&g->power_spinlock, flags);
+
+	switch (state) {
+	case NVGPU_STATE_POWERED_OFF:
+		str = "off";
+		break;
+	case NVGPU_STATE_POWERING_ON:
+		str = "powering on";
+		break;
+	case NVGPU_STATE_POWERED_ON:
+		str = "on";
+		break;
+	default:
+		nvgpu_err(g, "Invalid nvgpu power state.");
+		break;
+	}
+
+	return str;
+}
+
+bool nvgpu_is_powered_on(struct gk20a *g)
+{
+	unsigned long flags;
+	u32 power_on;
+
+	nvgpu_spinlock_irqsave(&g->power_spinlock, flags);
+	power_on = g->power_on_state;
+	nvgpu_spinunlock_irqrestore(&g->power_spinlock, flags);
+
+	return power_on == NVGPU_STATE_POWERED_ON;
+}
+
+bool nvgpu_is_powered_off(struct gk20a *g)
+{
+	unsigned long flags;
+	u32 power_on;
+
+	nvgpu_spinlock_irqsave(&g->power_spinlock, flags);
+	power_on = g->power_on_state;
+	nvgpu_spinunlock_irqrestore(&g->power_spinlock, flags);
+
+	return power_on == NVGPU_STATE_POWERED_OFF;
 }
 
 static int gk20a_pm_prepare_poweroff(struct device *dev)
@@ -407,24 +666,16 @@ static int gk20a_pm_prepare_poweroff(struct device *dev)
 	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
 #endif
 	struct gk20a_platform *platform = gk20a_get_platform(dev);
-	bool irqs_enabled;
 	int ret = 0;
 
 	nvgpu_log_fn(g, " ");
 
 	nvgpu_mutex_acquire(&g->power_lock);
 
-	if (!g->power_on)
+	if (nvgpu_is_powered_off(g))
 		goto done;
 
-	/* disable IRQs and wait for completion */
-	irqs_enabled = g->irqs_enabled;
-	if (irqs_enabled) {
-		disable_irq(g->irq_stall);
-		if (g->irq_stall != g->irq_nonstall)
-			disable_irq(g->irq_nonstall);
-		g->irqs_enabled = 0;
-	}
+	nvgpu_disable_irqs(g);
 
 	gk20a_scale_suspend(dev);
 
@@ -432,7 +683,7 @@ static int gk20a_pm_prepare_poweroff(struct device *dev)
 	gk20a_cde_suspend(l);
 #endif
 
-	ret = gk20a_prepare_poweroff(g);
+	ret = nvgpu_prepare_poweroff(g);
 	if (ret)
 		goto error;
 
@@ -443,22 +694,16 @@ static int gk20a_pm_prepare_poweroff(struct device *dev)
 	/* Stop CPU from accessing the GPU registers. */
 	gk20a_lockout_registers(g);
 
-#ifdef CONFIG_NVGPU_SUPPORT_LINUX_ECC_ERROR_REPORTING
-	nvgpu_disable_ecc_reporting(g);
-#endif
-
 	nvgpu_hide_usermode_for_poweroff(g);
+
+	nvgpu_set_power_state(g, NVGPU_STATE_POWERED_OFF);
+
 	nvgpu_mutex_release(&g->power_lock);
 	return 0;
 
 error:
-	/* re-enabled IRQs if previously enabled */
-	if (irqs_enabled) {
-		enable_irq(g->irq_stall);
-		if (g->irq_stall != g->irq_nonstall)
-			enable_irq(g->irq_nonstall);
-		g->irqs_enabled = 1;
-	}
+	/* Re-enable IRQs on error. This doesn't fail on Linux. */
+	(void) nvgpu_enable_irqs(g);
 
 	gk20a_scale_resume(dev);
 done:
@@ -473,48 +718,72 @@ static struct of_device_id tegra_gk20a_of_match[] = {
 		.data = &gm20b_tegra_platform },
 	{ .compatible = "nvidia,tegra186-gp10b",
 		.data = &gp10b_tegra_platform },
+	/*
+	 * Upstream device trees use nvidia,gp10b instead of
+	 * nvidia,tegra186-gp10b used in downstream.
+	 */
+	{ .compatible = "nvidia,gp10b",
+		.data = &gp10b_tegra_platform },
 	{ .compatible = "nvidia,gv11b",
 		.data = &gv11b_tegra_platform },
-#ifdef CONFIG_TEGRA_GR_VIRTUALIZATION
+#ifdef CONFIG_NVGPU_GR_VIRTUALIZATION
 	{ .compatible = "nvidia,gv11b-vgpu",
 		.data = &gv11b_vgpu_tegra_platform},
 #endif
-#ifdef CONFIG_TEGRA_GR_VIRTUALIZATION
-	{ .compatible = "nvidia,tegra124-gk20a-vgpu",
-		.data = &vgpu_tegra_platform },
+#if defined(CONFIG_NVGPU_NEXT) && defined(CONFIG_NVGPU_NON_FUSA)
+	{ .compatible = NVGPU_NEXT_COMPATIBLE,
+		.data = &NVGPU_NEXT_PLATFORM},
+#ifdef CONFIG_NVGPU_GR_VIRTUALIZATION
+	{ .compatible = NVGPU_NEXT_COMPATIBLE_VGPU,
+		.data = &NVGPU_NEXT_PLATFORM_VGPU},
 #endif
 #endif
-
+#endif
 	{ },
 };
 MODULE_DEVICE_TABLE(of, tegra_gk20a_of_match);
 
 #ifdef CONFIG_PM
 /**
- * __gk20a_do_idle() - force the GPU to idle and railgate
+ * gk20a_do_idle() - force the GPU to idle and railgate
  *
- * In success, this call MUST be balanced by caller with __gk20a_do_unidle()
+ * In success, this call MUST be balanced by caller with gk20a_do_unidle()
  *
  * Acquires two locks : &l->busy_lock and &platform->railgate_lock
  * In success, we hold these locks and return
  * In failure, we release these locks and return
  */
-int __gk20a_do_idle(struct gk20a *g, bool force_reset)
+int gk20a_do_idle(void *_g)
 {
+	struct gk20a *g = (struct gk20a *)_g;
 	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
 	struct device *dev = dev_from_gk20a(g);
 	struct gk20a_platform *platform = dev_get_drvdata(dev);
 	struct nvgpu_timeout timeout;
 	int ref_cnt;
 	int target_ref_cnt = 0;
-	bool is_railgated;
-	int err = 0;
+
+	if (!g->probe_done) {
+		/*
+		 * Note that autosuspend delay is 0 at this point hence the device
+		 * will suspend immediately. Deterministic channels, gk20a_busy and
+		 * unrailgate don't intervene during probe so no need to hold the
+		 * locks below.
+		 */
+		pm_runtime_put_sync_autosuspend(dev);
+		if (pm_runtime_status_suspended(dev)) {
+			return 0;
+		} else {
+			nvgpu_err(g, "failed to idle");
+			return -EBUSY;
+		}
+	}
 
 	/*
 	 * Hold back deterministic submits and changes to deterministic
 	 * channels - this must be outside the power busy locks.
 	 */
-	gk20a_channel_deterministic_idle(g);
+	nvgpu_channel_deterministic_idle(g);
 
 	/* acquire busy lock to block other busy() calls */
 	down_write(&l->busy_lock);
@@ -542,6 +811,7 @@ int __gk20a_do_idle(struct gk20a *g, bool force_reset)
 		target_ref_cnt = 1;
 	else
 		target_ref_cnt = 2;
+
 	nvgpu_mutex_acquire(&platform->railgate_lock);
 
 	nvgpu_timeout_init(g, &timeout, GK20A_WAIT_FOR_IDLE_MS,
@@ -556,133 +826,76 @@ int __gk20a_do_idle(struct gk20a *g, bool force_reset)
 	if (ref_cnt != target_ref_cnt) {
 		nvgpu_err(g, "failed to idle - refcount %d != target_ref_cnt",
 			ref_cnt);
-		goto fail_drop_usage_count;
+
+		pm_runtime_put_noidle(dev);
+
+		nvgpu_mutex_release(&platform->railgate_lock);
+		up_write(&l->busy_lock);
+		nvgpu_channel_deterministic_unidle(g);
+		return -EBUSY;
 	}
 
-	/* check if global force_reset flag is set */
-	force_reset |= platform->force_reset_in_do_idle;
+	/*
+	 * If railgating is enabled, autosuspend delay will be > 0. Set it to
+	 * 0 to suspend immediately. If railgating is disabled setting it to
+	 * 0 will reduce the usage count. pm_runtime_put_sync_autosuspend
+	 * will then suspend immediately.
+	 */
+	pm_runtime_set_autosuspend_delay(dev, 0);
 
-	nvgpu_timeout_init(g, &timeout, GK20A_WAIT_FOR_IDLE_MS,
-			   NVGPU_TIMER_CPU_TIMER);
+	pm_runtime_put_sync_autosuspend(dev);
 
-	if (nvgpu_is_enabled(g, NVGPU_CAN_RAILGATE) && !force_reset) {
-		/*
-		 * Case 1 : GPU railgate is supported
-		 *
-		 * if GPU is now idle, we will have only one ref count,
-		 * drop this ref which will rail gate the GPU
-		 */
-		pm_runtime_put_sync(dev);
-
-		/* add sufficient delay to allow GPU to rail gate */
-		nvgpu_msleep(g->railgate_delay);
-
-		/* check in loop if GPU is railgated or not */
-		do {
-			nvgpu_usleep_range(1000, 1100);
-			is_railgated = platform->is_railgated(dev);
-		} while (!is_railgated && !nvgpu_timeout_expired(&timeout));
-
-		if (is_railgated) {
-			return 0;
-		} else {
-			nvgpu_err(g, "failed to idle in timeout");
-			goto fail_timeout;
-		}
-	} else {
-		/*
-		 * Case 2 : GPU railgate is not supported or we explicitly
-		 * do not want to depend on runtime PM
-		 *
-		 * if GPU is now idle, call prepare_poweroff() to save the
-		 * state and then do explicit railgate
-		 *
-		 * __gk20a_do_unidle() needs to unrailgate, call
-		 * finalize_poweron(), and then call pm_runtime_put_sync()
-		 * to balance the GPU usage counter
-		 */
-
-		/* Save the GPU state */
-		err = gk20a_pm_prepare_poweroff(dev);
-		if (err)
-			goto fail_drop_usage_count;
-
-		/* railgate GPU */
-		platform->railgate(dev);
-
-		nvgpu_udelay(10);
-
-		g->forced_reset = true;
+	if (pm_runtime_status_suspended(dev)) {
 		return 0;
+	} else {
+		nvgpu_err(g, "failed to idle in timeout");
+		/*
+		 * gk20a_do_unidle will release the locks and reset the
+		 * autosuspend delay.
+		 */
+		(void) gk20a_do_unidle(g);
+		return -EBUSY;
 	}
-
-fail_drop_usage_count:
-	pm_runtime_put_noidle(dev);
-fail_timeout:
-	nvgpu_mutex_release(&platform->railgate_lock);
-	up_write(&l->busy_lock);
-	gk20a_channel_deterministic_unidle(g);
-	return -EBUSY;
 }
 
 /**
- * gk20a_do_idle() - wrap up for __gk20a_do_idle() to be called
- * from outside of GPU driver
- *
- * In success, this call MUST be balanced by caller with gk20a_do_unidle()
+ * gk20a_do_unidle() - unblock all the tasks blocked by gk20a_do_idle()
  */
-static int gk20a_do_idle(void *_g)
+int gk20a_do_unidle(void *_g)
 {
 	struct gk20a *g = (struct gk20a *)_g;
-
-	return __gk20a_do_idle(g, true);
-}
-
-/**
- * __gk20a_do_unidle() - unblock all the tasks blocked by __gk20a_do_idle()
- */
-int __gk20a_do_unidle(struct gk20a *g)
-{
 	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
 	struct device *dev = dev_from_gk20a(g);
 	struct gk20a_platform *platform = dev_get_drvdata(dev);
-	int err;
 
-	if (g->forced_reset) {
-		/*
-		 * If we did a forced-reset/railgate
-		 * then unrailgate the GPU here first
-		 */
-		platform->unrailgate(dev);
-
-		/* restore the GPU state */
-		err = gk20a_pm_finalize_poweron(dev);
-		if (err)
-			return err;
-
-		/* balance GPU usage counter */
-		pm_runtime_put_sync(dev);
-
-		g->forced_reset = false;
+	if (!g->probe_done) {
+		pm_runtime_get_sync(dev);
+		if (pm_runtime_active(dev)) {
+			return 0;
+		} else {
+			nvgpu_err(g, "failed to unidle");
+			return -EBUSY;
+		}
 	}
 
-	/* release the lock and open up all other busy() calls */
+	/*
+	 * Release the railgate_lock here as setting autosuspend_delay to -1
+	 * resumes the device that needs this lock.
+	 */
 	nvgpu_mutex_release(&platform->railgate_lock);
+
+	if (g->railgate_delay && nvgpu_is_enabled(g, NVGPU_CAN_RAILGATE))
+		pm_runtime_set_autosuspend_delay(dev,
+				 g->railgate_delay);
+	else
+		pm_runtime_set_autosuspend_delay(dev, -1);
+
+	/* release the lock and open up all other busy() calls */
 	up_write(&l->busy_lock);
 
-	gk20a_channel_deterministic_unidle(g);
+	nvgpu_channel_deterministic_unidle(g);
 
 	return 0;
-}
-
-/**
- * gk20a_do_unidle() - wrap up for __gk20a_do_unidle()
- */
-static int gk20a_do_unidle(void *_g)
-{
-	struct gk20a *g = (struct gk20a *)_g;
-
-	return __gk20a_do_unidle(g);
 }
 #endif
 
@@ -717,22 +930,33 @@ u64 nvgpu_resource_addr(struct platform_device *dev, int i)
 static irqreturn_t gk20a_intr_isr_stall(int irq, void *dev_id)
 {
 	struct gk20a *g = dev_id;
+	u32 err = nvgpu_cic_intr_stall_isr(g);
 
-	return nvgpu_intr_stall(g);
+	return err == NVGPU_CIC_INTR_HANDLE ? IRQ_WAKE_THREAD : IRQ_NONE;
+}
+
+static irqreturn_t gk20a_intr_thread_isr_stall(int irq, void *dev_id)
+{
+	struct gk20a *g = dev_id;
+
+	nvgpu_cic_intr_stall_handle(g);
+	return IRQ_HANDLED;
 }
 
 static irqreturn_t gk20a_intr_isr_nonstall(int irq, void *dev_id)
 {
 	struct gk20a *g = dev_id;
+	u32 err = nvgpu_cic_intr_nonstall_isr(g);
 
-	return nvgpu_intr_nonstall(g);
+	return err == NVGPU_CIC_INTR_HANDLE ? IRQ_WAKE_THREAD : IRQ_NONE;
 }
 
-static irqreturn_t gk20a_intr_thread_stall(int irq, void *dev_id)
+static irqreturn_t gk20a_intr_thread_isr_nonstall(int irq, void *dev_id)
 {
 	struct gk20a *g = dev_id;
 
-	return nvgpu_intr_thread_stall(g);
+	nvgpu_cic_intr_nonstall_handle(g);
+	return IRQ_HANDLED;
 }
 
 void gk20a_remove_support(struct gk20a *g)
@@ -740,27 +964,33 @@ void gk20a_remove_support(struct gk20a *g)
 	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
 	struct sim_nvgpu_linux *sim_linux;
 
-	tegra_unregister_idle_unidle(gk20a_do_idle);
+#ifdef CONFIG_NVGPU_VPR
+	if (nvgpu_is_enabled(g, NVGPU_SUPPORT_VPR)) {
+		tegra_unregister_idle_unidle(gk20a_do_idle);
+	}
+#endif
 
+#ifdef CONFIG_NVGPU_DEBUGGER
 	nvgpu_kfree(g, g->dbg_regops_tmp_buf);
+#endif
 
-	nvgpu_remove_channel_support_linux(l);
+	nvgpu_channel_remove_support_linux(l);
 
-	if (g->pmu.remove_support)
-		g->pmu.remove_support(&g->pmu);
-
-	if (g->acr.remove_support != NULL) {
-		g->acr.remove_support(&g->acr);
+	if (g->sec2.remove_support != NULL) {
+		g->sec2.remove_support(&g->sec2);
 	}
 
-	if (g->gr.remove_support)
-		g->gr.remove_support(&g->gr);
+	nvgpu_gr_remove_support(g);
 
+#ifdef CONFIG_NVGPU_DGPU
 	if (g->mm.remove_ce_support)
 		g->mm.remove_ce_support(&g->mm);
+#endif
 
 	if (g->fifo.remove_support)
 		g->fifo.remove_support(&g->fifo);
+
+	nvgpu_pmu_remove_support(g, g->pmu);
 
 	if (g->mm.remove_support)
 		g->mm.remove_support(&g->mm);
@@ -773,9 +1003,16 @@ void gk20a_remove_support(struct gk20a *g)
 			sim_linux->remove_support_linux(g);
 	}
 
+#if defined(CONFIG_NVGPU_CYCLESTATS)
+	nvgpu_free_cyclestats_snapshot_data(g);
+#endif
+
+	nvgpu_fbp_remove_support(g);
+
 	nvgpu_remove_usermode_support(g);
 
 	nvgpu_free_enabled_flags(g);
+	nvgpu_free_errata_flags(g);
 
 	gk20a_lockout_registers(g);
 }
@@ -785,35 +1022,41 @@ static int gk20a_init_support(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct gk20a *g = get_gk20a(dev);
 	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
+	void __iomem *addr;
 	int err = -ENOMEM;
 
+#ifdef CONFIG_NVGPU_VPR
 	tegra_register_idle_unidle(gk20a_do_idle, gk20a_do_unidle, g);
+#endif
 
-	l->regs = nvgpu_devm_ioremap_resource(pdev,
+	addr = nvgpu_devm_ioremap_resource(pdev,
 					      GK20A_BAR0_IORESOURCE_MEM,
 					      &l->reg_mem);
-	if (IS_ERR(l->regs)) {
+	if (IS_ERR(addr)) {
 		nvgpu_err(g, "failed to remap gk20a registers");
-		err = PTR_ERR(l->regs);
+		err = PTR_ERR(addr);
 		goto fail;
 	}
+	g->regs = (uintptr_t)addr;
+	g->regs_size = resource_size(l->reg_mem);
 
-	l->regs_bus_addr = nvgpu_resource_addr(pdev,
+	g->regs_bus_addr = nvgpu_resource_addr(pdev,
 			GK20A_BAR0_IORESOURCE_MEM);
-	if (!l->regs_bus_addr) {
+	if (!g->regs_bus_addr) {
 		nvgpu_err(g, "failed to read register bus offset");
 		err = -ENODEV;
 		goto fail;
 	}
 
-	l->bar1 = nvgpu_devm_ioremap_resource(pdev,
+	addr = nvgpu_devm_ioremap_resource(pdev,
 					      GK20A_BAR1_IORESOURCE_MEM,
 					      &l->bar1_mem);
-	if (IS_ERR(l->bar1)) {
+	if (IS_ERR(addr)) {
 		nvgpu_err(g, "failed to remap gk20a bar1");
-		err = PTR_ERR(l->bar1);
+		err = PTR_ERR(addr);
 		goto fail;
 	}
+	g->bar1 = (uintptr_t)addr;
 
 	err = nvgpu_init_sim_support_linux(g, pdev);
 	if (err)
@@ -828,11 +1071,11 @@ static int gk20a_init_support(struct platform_device *pdev)
 fail_sim:
 	nvgpu_remove_sim_support_linux(g);
 fail:
-	if (l->regs)
-		l->regs = NULL;
+	if (g->regs)
+		g->regs = 0U;
 
-	if (l->bar1)
-		l->bar1 = NULL;
+	if (g->bar1)
+		g->bar1 = 0U;
 
 	return err;
 }
@@ -870,9 +1113,6 @@ static int gk20a_pm_railgate(struct device *dev)
 #ifdef CONFIG_DEBUG_FS
 	g->pstats.last_rail_gate_complete = jiffies;
 #endif
-	ret = tegra_fuse_clock_disable();
-	if (ret)
-		nvgpu_err(g, "failed to disable tegra fuse clock, err=%d", ret);
 
 	return ret;
 }
@@ -881,17 +1121,14 @@ static int gk20a_pm_unrailgate(struct device *dev)
 {
 	struct gk20a_platform *platform = dev_get_drvdata(dev);
 	int ret = 0;
+#ifdef CONFIG_DEBUG_FS
 	struct gk20a *g = get_gk20a(dev);
+#endif
 
 	/* return early if platform didn't implement unrailgate */
 	if (!platform->unrailgate)
 		return 0;
 
-	ret = tegra_fuse_clock_enable();
-	if (ret) {
-		nvgpu_err(g, "failed to enable tegra fuse clock, err=%d", ret);
-		return ret;
-	}
 #ifdef CONFIG_DEBUG_FS
 	g->pstats.last_rail_ungate_start = jiffies;
 	if (g->pstats.railgating_cycle_count >= 1)
@@ -903,7 +1140,9 @@ static int gk20a_pm_unrailgate(struct device *dev)
 	g->pstats.railgating_cycle_count++;
 #endif
 
+#ifdef CONFIG_NVGPU_TRACE
 	trace_gk20a_pm_unrailgate(dev_name(dev));
+#endif
 
 	nvgpu_mutex_acquire(&platform->railgate_lock);
 	ret = platform->unrailgate(dev);
@@ -922,10 +1161,15 @@ static int gk20a_pm_unrailgate(struct device *dev)
 void nvgpu_free_irq(struct gk20a *g)
 {
 	struct device *dev = dev_from_gk20a(g);
+	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
+	u32 i;
 
-	devm_free_irq(dev, g->irq_stall, g);
-	if (g->irq_stall != g->irq_nonstall)
-		devm_free_irq(dev, g->irq_nonstall, g);
+	for (i = 0U; i < l->interrupts.stall_size; i++) {
+		devm_free_irq(dev, l->interrupts.stall_lines[i], g);
+	}
+	if (l->interrupts.nonstall_size > 0) {
+		devm_free_irq(dev, l->interrupts.nonstall_line, g);
+	}
 }
 
 /*
@@ -939,14 +1183,14 @@ int nvgpu_quiesce(struct gk20a *g)
 	int err;
 	struct device *dev = dev_from_gk20a(g);
 
-	if (g->power_on) {
-		err = gk20a_wait_for_idle(g);
+	if (nvgpu_is_powered_on(g)) {
+		err = nvgpu_wait_for_idle(g);
 		if (err) {
 			nvgpu_err(g, "failed to idle GPU, err=%d", err);
 			return err;
 		}
 
-		err = gk20a_fifo_disable_all_engine_activity(g, true);
+		err = nvgpu_engine_disable_activity_all(g, true);
 		if (err) {
 			nvgpu_err(g,
 				"failed to disable engine activity, err=%d",
@@ -954,7 +1198,7 @@ int nvgpu_quiesce(struct gk20a *g)
 		return err;
 		}
 
-		err = gk20a_fifo_wait_engine_idle(g);
+		err = nvgpu_engine_wait_for_idle(g);
 		if (err) {
 			nvgpu_err(g, "failed to idle engines, err=%d",
 				err);
@@ -986,7 +1230,7 @@ static void gk20a_pm_shutdown(struct platform_device *pdev)
 	if (gk20a_gpu_is_virtual(&pdev->dev))
 		return;
 
-	if (!g->power_on)
+	if (nvgpu_is_powered_off(g))
 		goto finish;
 
 	gk20a_driver_start_unload(g);
@@ -1017,11 +1261,16 @@ finish:
 #ifdef CONFIG_PM
 static int gk20a_pm_runtime_resume(struct device *dev)
 {
+	struct gk20a *g = get_gk20a(dev);
 	int err = 0;
 
 	err = gk20a_pm_unrailgate(dev);
 	if (err)
 		goto fail;
+
+	if (!g->probe_done) {
+		return 0;
+	}
 
 	if (gk20a_gpu_is_virtual(dev))
 		err = vgpu_pm_finalize_poweron(dev);
@@ -1045,6 +1294,13 @@ static int gk20a_pm_runtime_suspend(struct device *dev)
 
 	if (!g)
 		return 0;
+
+	if (!g->probe_done) {
+		err = gk20a_pm_railgate(dev);
+		if (err)
+			pm_runtime_mark_last_busy(dev);
+		return err;
+	}
 
 	if (gk20a_gpu_is_virtual(dev))
 		err = vgpu_pm_prepare_poweroff(dev);
@@ -1075,7 +1331,7 @@ static int gk20a_pm_suspend(struct device *dev)
 	int usage_count;
 	struct nvgpu_timeout timeout;
 
-	if (!g->power_on) {
+	if (nvgpu_is_powered_off(g)) {
 		if (platform->suspend)
 			ret = platform->suspend(dev);
 
@@ -1094,7 +1350,7 @@ static int gk20a_pm_suspend(struct device *dev)
 	 * Hold back deterministic submits and changes to deterministic
 	 * channels - this must be outside the power busy locks.
 	 */
-	gk20a_channel_deterministic_idle(g);
+	nvgpu_channel_deterministic_idle(g);
 
 	/* check and wait until GPU is idle (with a timeout) */
 	do {
@@ -1124,7 +1380,7 @@ static int gk20a_pm_suspend(struct device *dev)
 fail_suspend:
 	gk20a_pm_runtime_resume(dev);
 fail_idle:
-	gk20a_channel_deterministic_unidle(g);
+	nvgpu_channel_deterministic_unidle(g);
 	return ret;
 }
 
@@ -1157,7 +1413,7 @@ static int gk20a_pm_resume(struct device *dev)
 
 	g->suspended = false;
 
-	gk20a_channel_deterministic_unidle(g);
+	nvgpu_channel_deterministic_unidle(g);
 
 	return ret;
 }
@@ -1178,9 +1434,27 @@ static int gk20a_pm_init(struct device *dev)
 	nvgpu_log_fn(g, " ");
 
 	/*
-	 * Initialise pm runtime. For railgate disable
-	 * case, set autosuspend delay to negative which
-	 * will suspend runtime pm
+	 * runtime PM is enabled here. Irrespective of the device power state,
+	 * it is resumed and suspended as part of nvgpu_probe due to dependency
+	 * on clocks setup. From there onwards runtime PM is truly enabled.
+	 */
+	pm_runtime_enable(dev);
+
+	return err;
+}
+
+static int gk20a_pm_late_init(struct device *dev)
+{
+	struct gk20a *g = get_gk20a(dev);
+	int err = 0;
+
+	nvgpu_log_fn(g, " ");
+
+	pm_runtime_disable(dev);
+
+	/*
+	 * For railgate disable case, set autosuspend delay to negative which
+	 * will avoid runtime pm suspend.
 	 */
 	if (g->railgate_delay && nvgpu_is_enabled(g, NVGPU_CAN_RAILGATE))
 		pm_runtime_set_autosuspend_delay(dev,
@@ -1201,35 +1475,51 @@ static int gk20a_pm_deinit(struct device *dev)
 	return 0;
 }
 
+void nvgpu_start_gpu_idle(struct gk20a *g)
+{
+	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
+
+	down_write(&l->busy_lock);
+	nvgpu_set_enabled(g, NVGPU_DRIVER_IS_DYING, true);
+	/*
+	 * GR SW ready needs to be invalidated at this time with the busy lock
+	 * held to prevent a racing condition on the gr/mm code
+	 */
+	nvgpu_gr_sw_ready(g, false);
+	g->sw_ready = false;
+	up_write(&l->busy_lock);
+}
+
+int nvgpu_wait_for_gpu_idle(struct gk20a *g)
+{
+	int ret = 0;
+
+	ret = nvgpu_wait_for_idle(g);
+	if (ret) {
+		nvgpu_err(g, "failed in wait for idle");
+		goto out;
+	}
+
+	nvgpu_cic_wait_for_deferred_interrupts(g);
+out:
+	return ret;
+}
+
 /*
  * Start the process for unloading the driver. Set NVGPU_DRIVER_IS_DYING.
  */
 void gk20a_driver_start_unload(struct gk20a *g)
 {
-	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
-
 	nvgpu_log(g, gpu_dbg_shutdown, "Driver is now going down!\n");
 
-	down_write(&l->busy_lock);
-	__nvgpu_set_enabled(g, NVGPU_DRIVER_IS_DYING, true);
-	/* GR SW ready needs to be invalidated at this time with the busy lock
-	 * held to prevent a racing condition on the gr/mm code */
-	g->gr.sw_ready = false;
-	g->sw_ready = false;
-	up_write(&l->busy_lock);
+	nvgpu_start_gpu_idle(g);
 
 	if (g->is_virtual)
 		return;
 
-	gk20a_wait_for_idle(g);
+	nvgpu_wait_for_idle(g);
 
-	nvgpu_wait_for_deferred_interrupts(g);
-
-	if (l->nonstall_work_queue) {
-		cancel_work_sync(&l->nonstall_fn_work);
-		destroy_workqueue(l->nonstall_work_queue);
-		l->nonstall_work_queue = NULL;
-	}
+	nvgpu_cic_wait_for_deferred_interrupts(g);
 }
 
 static inline void set_gk20a(struct platform_device *pdev, struct gk20a *gk20a)
@@ -1239,6 +1529,7 @@ static inline void set_gk20a(struct platform_device *pdev, struct gk20a *gk20a)
 
 static int nvgpu_read_fuse_overrides(struct gk20a *g)
 {
+#ifdef CONFIG_NVGPU_TEGRA_FUSE
 	struct device_node *np = nvgpu_get_node(g);
 	struct gk20a_platform *platform = dev_get_drvdata(dev_from_gk20a(g));
 	u32 *fuses;
@@ -1265,7 +1556,7 @@ static int nvgpu_read_fuse_overrides(struct gk20a *g)
 			g->tpc_fs_mask_user = ~value;
 			break;
 		case GP10B_FUSE_OPT_ECC_EN:
-			g->gr.fecs_feature_override_ecc_val = value;
+			g->fecs_feature_override_ecc_val = value;
 			break;
 		case GV11B_FUSE_OPT_TPC_DISABLE:
 			if (platform->set_tpc_pg_mask != NULL)
@@ -1279,7 +1570,7 @@ static int nvgpu_read_fuse_overrides(struct gk20a *g)
 	}
 
 	nvgpu_kfree(g, fuses);
-
+#endif
 	return 0;
 }
 
@@ -1290,6 +1581,7 @@ static int gk20a_probe(struct platform_device *dev)
 	int err;
 	struct gk20a_platform *platform = NULL;
 	struct device_node *np;
+	u32 i, intr_size, irq_idx;
 
 	if (dev->dev.of_node) {
 		const struct of_device_id *match;
@@ -1316,63 +1608,92 @@ static int gk20a_probe(struct platform_device *dev)
 		return -ENOMEM;
 	}
 
-	hash_init(l->ecc_sysfs_stats_htable);
-
 	gk20a = &l->g;
 
 	nvgpu_log_fn(gk20a, " ");
 
 	nvgpu_init_gk20a(gk20a);
 	set_gk20a(dev, gk20a);
+	gk20a->probe_done = false;
 	l->dev = &dev->dev;
 	gk20a->log_mask = NVGPU_DEFAULT_DBG_MASK;
 
 	nvgpu_kmem_init(gk20a);
 
+	err = nvgpu_init_errata_flags(gk20a);
+	if (err)
+		goto return_err_platform;
+
 	err = nvgpu_init_enabled_flags(gk20a);
 	if (err)
-		goto return_err;
+		goto return_err_errata;
 
 	np = nvgpu_get_node(gk20a);
 	if (of_dma_is_coherent(np)) {
-		__nvgpu_set_enabled(gk20a, NVGPU_USE_COHERENT_SYSMEM, true);
-		__nvgpu_set_enabled(gk20a, NVGPU_SUPPORT_IO_COHERENCE, true);
+		nvgpu_set_enabled(gk20a, NVGPU_USE_COHERENT_SYSMEM, true);
+		nvgpu_set_enabled(gk20a, NVGPU_SUPPORT_IO_COHERENCE, true);
 	}
 
 	if (nvgpu_platform_is_simulation(gk20a))
-		__nvgpu_set_enabled(gk20a, NVGPU_IS_FMODEL, true);
+		nvgpu_set_enabled(gk20a, NVGPU_IS_FMODEL, true);
 
-	gk20a->irq_stall = platform_get_irq(dev, 0);
-	gk20a->irq_nonstall = platform_get_irq(dev, 1);
-	if (gk20a->irq_stall < 0 || gk20a->irq_nonstall < 0) {
+	intr_size = platform_irq_count(dev);
+	if (intr_size > 0U && intr_size <= NVGPU_MAX_INTERRUPTS) {
+		irq_idx = 0U;
+
+		/* Single interrupt line could be a stall line*/
+		l->interrupts.nonstall_size = intr_size == 1U ? 0U : 1U;
+		l->interrupts.stall_size = intr_size - l->interrupts.nonstall_size;
+
+		for (i = 0U; i < l->interrupts.stall_size; i++) {
+			l->interrupts.stall_lines[i] = platform_get_irq(dev, i);
+			if ((int)l->interrupts.stall_lines[i] < 0) {
+				err = -ENXIO;
+				goto return_err;
+			}
+		}
+		if (l->interrupts.nonstall_size > 0U) {
+			l->interrupts.nonstall_line = platform_get_irq(dev, i);
+			if ((int)l->interrupts.nonstall_line < 0) {
+				err = -ENXIO;
+				goto return_err;
+			}
+		}
+	} else {
+		dev_err(&dev->dev, "Invalid intr lines\n");
 		err = -ENXIO;
 		goto return_err;
 	}
 
-	err = devm_request_threaded_irq(&dev->dev,
-			gk20a->irq_stall,
+	for (i = 0U; i < l->interrupts.stall_size; i++) {
+		err = devm_request_threaded_irq(&dev->dev,
+			l->interrupts.stall_lines[i],
 			gk20a_intr_isr_stall,
-			gk20a_intr_thread_stall,
+			gk20a_intr_thread_isr_stall,
 			0, "gk20a_stall", gk20a);
-	if (err) {
-		dev_err(&dev->dev,
+		if (err) {
+			dev_err(&dev->dev,
 			"failed to request stall intr irq @ %d\n",
-				gk20a->irq_stall);
-		goto return_err;
+				l->interrupts.stall_lines[i]);
+			goto return_err;
+
+		}
 	}
-	err = devm_request_irq(&dev->dev,
-			gk20a->irq_nonstall,
+	if (l->interrupts.nonstall_size > 0) {
+		err = devm_request_threaded_irq(&dev->dev,
+			l->interrupts.nonstall_line,
 			gk20a_intr_isr_nonstall,
-			0, "gk20a_nonstall", gk20a);
-	if (err) {
-		dev_err(&dev->dev,
-			"failed to request non-stall intr irq @ %d\n",
-				gk20a->irq_nonstall);
-		goto return_err;
+			gk20a_intr_thread_isr_nonstall,
+				0, "gk20a_nonstall", gk20a);
+		if (err) {
+			dev_err(&dev->dev,
+				"failed to request non-stall intr irq @ %d\n",
+					l->interrupts.nonstall_line);
+			goto return_err;
+		}
 	}
-	disable_irq(gk20a->irq_stall);
-	if (gk20a->irq_stall != gk20a->irq_nonstall)
-		disable_irq(gk20a->irq_nonstall);
+
+	nvgpu_disable_irqs(gk20a);
 
 	err = gk20a_init_support(dev);
 	if (err)
@@ -1386,42 +1707,51 @@ static int gk20a_probe(struct platform_device *dev)
 		platform->reset_control = NULL;
 #endif
 
-	err = nvgpu_probe(gk20a, "gpu.0", INTERFACE_NAME, &nvgpu_class);
-	if (err)
-		goto return_err;
-
 	err = gk20a_pm_init(&dev->dev);
 	if (err) {
 		dev_err(&dev->dev, "pm init failed");
 		goto return_err;
 	}
 
-#ifdef CONFIG_NVGPU_SUPPORT_LINUX_ECC_ERROR_REPORTING
-	nvgpu_init_ecc_reporting(gk20a);
-#endif
-
-	gk20a->nvgpu_reboot_nb.notifier_call =
-		nvgpu_kernel_shutdown_notification;
-	err = register_reboot_notifier(&gk20a->nvgpu_reboot_nb);
+	err = nvgpu_probe(gk20a, "gpu.0");
 	if (err)
 		goto return_err;
+
+	err = gk20a_pm_late_init(&dev->dev);
+	if (err) {
+		dev_err(&dev->dev, "pm late_init failed");
+		goto return_err;
+	}
+
+	l->nvgpu_reboot_nb.notifier_call =
+		nvgpu_kernel_shutdown_notification;
+	err = register_reboot_notifier(&l->nvgpu_reboot_nb);
+	if (err)
+		goto return_err;
+
+	nvgpu_mutex_init(&l->dmabuf_priv_list_lock);
+	nvgpu_init_list_node(&l->dmabuf_priv_list);
+
+	gk20a->probe_done = true;
 
 	return 0;
 
 return_err:
 	nvgpu_free_enabled_flags(gk20a);
+return_err_errata:
+	nvgpu_free_errata_flags(gk20a);
+return_err_platform:
 
 	/*
 	 * Last since the above allocs may use data structures in here.
 	 */
 	nvgpu_kmem_fini(gk20a, NVGPU_KMEM_FINI_FORCE_CLEANUP);
-
 	kfree(l);
 
 	return err;
 }
 
-int nvgpu_remove(struct device *dev, struct class *class)
+int nvgpu_remove(struct device *dev)
 {
 	struct gk20a *g = get_gk20a(dev);
 #ifdef CONFIG_NVGPU_SUPPORT_CDE
@@ -1443,7 +1773,7 @@ int nvgpu_remove(struct device *dev, struct class *class)
 		gk20a_cde_destroy(l);
 #endif
 
-#ifdef CONFIG_GK20A_CTXSW_TRACE
+#ifdef CONFIG_NVGPU_FECS_TRACE
 	gk20a_ctxsw_trace_cleanup(g);
 #endif
 
@@ -1454,7 +1784,9 @@ int nvgpu_remove(struct device *dev, struct class *class)
 
 	nvgpu_clk_arb_cleanup_arbiter(g);
 
-	gk20a_user_deinit(dev, class);
+	gk20a_user_nodes_deinit(dev_from_gk20a(g));
+
+	gk20a_power_node_deinit(dev_from_gk20a(g));
 
 	gk20a_debug_deinit(g);
 
@@ -1479,17 +1811,21 @@ static int __exit gk20a_remove(struct platform_device *pdev)
 	int err;
 	struct device *dev = &pdev->dev;
 	struct gk20a *g = get_gk20a(dev);
+	struct nvgpu_os_linux *l = nvgpu_os_linux_from_gk20a(g);
 
 	if (gk20a_gpu_is_virtual(dev))
 		return vgpu_remove(pdev);
 
-	err = nvgpu_remove(dev, &nvgpu_class);
+	err = nvgpu_remove(dev);
 
-	unregister_reboot_notifier(&g->nvgpu_reboot_nb);
+	gk20a_dma_buf_priv_list_clear(l);
+	nvgpu_mutex_destroy(&l->dmabuf_priv_list_lock);
+
+	unregister_reboot_notifier(&l->nvgpu_reboot_nb);
 
 	set_gk20a(pdev, NULL);
 
-	gk20a_put(g);
+	nvgpu_put(g);
 
 	gk20a_pm_deinit(dev);
 
@@ -1514,19 +1850,10 @@ static struct platform_driver gk20a_driver = {
 	}
 };
 
-struct class nvgpu_class = {
-	.owner = THIS_MODULE,
-	.name = CLASS_NAME,
-};
-
 static int __init gk20a_init(void)
 {
 
 	int ret;
-
-	ret = class_register(&nvgpu_class);
-	if (ret)
-		return ret;
 
 	ret = nvgpu_pci_init();
 	if (ret)
@@ -1539,7 +1866,6 @@ static void __exit gk20a_exit(void)
 {
 	nvgpu_pci_exit();
 	platform_driver_unregister(&gk20a_driver);
-	class_unregister(&nvgpu_class);
 }
 
 MODULE_LICENSE("GPL v2");
