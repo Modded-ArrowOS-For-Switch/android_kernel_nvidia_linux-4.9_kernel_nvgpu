@@ -705,7 +705,7 @@ static inline s32 nvgpu_safe_cast_s64_to_s32(s64 sl_a)
  * fixed.
  */
 #if !defined(__ARM_FEATURE_UNALIGNED)
-#error "__ARM_FEATURE_UNALIGNED not defined. Check static_analysis.h"
+//#error "__ARM_FEATURE_UNALIGNED not defined. Check static_analysis.h"
 #endif
 
 #endif
